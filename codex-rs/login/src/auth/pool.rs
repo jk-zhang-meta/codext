@@ -496,23 +496,33 @@ struct RateWindow {
 /// 次跑就撞上了，一个池子建立之前的会话被记了 24601 个 token。
 fn collect_sessions(codex_home: &Path, held: &str, started: SystemTime) -> Vec<SessionUsage> {
     let mut owners = load_attribution(codex_home);
+    let mut seen = Vec::new();
     let mut sessions = Vec::new();
     for (modified, path) in recent_rollouts(codex_home) {
-        let Some(mut usage) = read_rollout(&path) else {
+        let session_id = rollout_session_id(&path);
+        if session_id.is_empty() {
             continue;
-        };
-        let owner = match owners.get(&usage.session_id) {
+        }
+        let owner = match owners.get(&session_id) {
             Some(owner) => owner.clone(),
             None if modified >= started => {
-                owners.insert(usage.session_id.clone(), held.to_string());
+                owners.insert(session_id.clone(), held.to_string());
                 held.to_string()
             }
             None => continue,
         };
+        seen.push(session_id);
+        // 归属**按文件名认，不等有用量才认**。一次运行里最早那次扫描通常发生在
+        // 第一个响应之前，那时 rollout 还没有 `token_count`；要是那时不落归属，
+        // 这个会话就永远没有主人，下一次运行也不敢认领它——于是每一轮的最后一次
+        // 响应都会丢，而只跑一轮的 `codex exec` 等于什么都报不出来。
+        let Some(mut usage) = read_rollout(&path) else {
+            continue;
+        };
         usage.account_key = Some(owner);
         sessions.push(usage);
     }
-    save_attribution(codex_home, &owners, &sessions);
+    save_attribution(codex_home, &owners, &seen);
     sessions
 }
 
@@ -546,15 +556,15 @@ fn load_attribution(codex_home: &Path) -> std::collections::HashMap<String, Stri
 fn save_attribution(
     codex_home: &Path,
     owners: &std::collections::HashMap<String, String>,
-    sessions: &[SessionUsage],
+    seen: &[String],
 ) {
-    let kept: std::collections::HashMap<&str, &str> = sessions
+    let kept: std::collections::HashMap<&str, &str> = seen
         .iter()
         .take(MAX_ATTRIBUTIONS)
-        .filter_map(|usage| {
+        .filter_map(|session_id| {
             owners
-                .get(&usage.session_id)
-                .map(|owner| (usage.session_id.as_str(), owner.as_str()))
+                .get(session_id)
+                .map(|owner| (session_id.as_str(), owner.as_str()))
         })
         .collect();
     let Ok(body) = serde_json::to_string(&kept) else {

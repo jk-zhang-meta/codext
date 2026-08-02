@@ -136,6 +136,36 @@ fn a_session_keeps_the_account_that_actually_served_it() {
     assert_eq!(again[0].account_key.as_deref(), Some("acct-a"));
 }
 
+/// 归属要在**还没有用量**的时候就落下。
+///
+/// 一次运行里最早那次扫描发生在第一个响应之前，那时 rollout 只有会话头、没有
+/// `token_count`。那时不落归属的话这个会话就永远没有主人，下一次运行也不敢认领
+/// ——于是每一轮的最后一次响应都会丢，而只跑一轮的 `codex exec` 等于什么都报不
+/// 出来。真机上就是这么坏的：两次运行跑通了请求，库里一行用量都没有。
+#[test]
+fn a_session_is_claimed_before_it_has_any_usage() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let day = home.path().join("sessions/2026/08/03");
+    std::fs::create_dir_all(&day).expect("session dir");
+    // 只有会话头，没有 token_count —— 第一个响应还没回来的样子。
+    write_rollout(
+        &day,
+        &[serde_json::json!({"timestamp": "2026-08-03T00:00:00.000Z",
+                             "type": "session_meta", "payload": {}})],
+    );
+    let long_ago = std::time::SystemTime::UNIX_EPOCH;
+    assert!(
+        super::collect_sessions(home.path(), "acct-a", long_ago).is_empty(),
+        "还没有用量，这一轮不该报任何东西"
+    );
+
+    // 响应回来了，rollout 补上 token_count。此刻「本次运行」已经是新的一次了。
+    write_rollout(&day, &[token_count_event(1_000, 5.0)]);
+    let later = super::collect_sessions(home.path(), "acct-b", std::time::SystemTime::now());
+    assert_eq!(later.len(), 1, "上一次运行的尾巴必须补得上来");
+    assert_eq!(later[0].account_key.as_deref(), Some("acct-a"));
+}
+
 /// 本次运行没碰过、又没有归属记录的会话，一条都不能认领。
 ///
 /// 同一个 `CODEX_HOME` 里躺着装池子之前的历史、以及用户自己 `codex login` 跑的
