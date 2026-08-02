@@ -113,6 +113,64 @@ fn all_null_windows_do_not_become_a_zero_usage_reading() {
     assert!(usage.rate_limits.is_none(), "全 null 的窗口不能变成一条读数");
 }
 
+/// 已经归属过的会话不能改记到现在这个号头上。
+///
+/// 上报要跨运行才补得全：一次 `codex exec` 的最后一轮响应写完 rollout 就退出了，
+/// 没有后续调用能把它带上去，只能等下一次运行补报——而那时手上很可能是另一个号。
+/// 用量的唯一键是 (session_id, account_key)，记错号不是覆盖而是**多出一整行**，
+/// 两个号各背一份完整用量。
+#[test]
+fn a_session_keeps_the_account_that_actually_served_it() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let day = home.path().join("sessions/2026/08/03");
+    std::fs::create_dir_all(&day).expect("session dir");
+    write_rollout(&day, &[token_count_event(1_000, 5.0)]);
+
+    let long_ago = std::time::SystemTime::UNIX_EPOCH;
+    let first = super::collect_sessions(home.path(), "acct-a", long_ago);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].account_key.as_deref(), Some("acct-a"));
+
+    // 下一次运行手上是另一个号，但这个会话是 acct-a 跑的。
+    let again = super::collect_sessions(home.path(), "acct-b", std::time::SystemTime::now());
+    assert_eq!(again[0].account_key.as_deref(), Some("acct-a"));
+}
+
+/// 本次运行没碰过、又没有归属记录的会话，一条都不能认领。
+///
+/// 同一个 `CODEX_HOME` 里躺着装池子之前的历史、以及用户自己 `codex login` 跑的
+/// 会话。认领它们等于把一整份用量凭空记到当前这个号头上——真机第一次跑就撞上了，
+/// 一个池子建立之前的会话被记了 24601 个 token。
+#[test]
+fn a_session_from_before_the_pool_is_not_claimed() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let day = home.path().join("sessions/2026/08/03");
+    std::fs::create_dir_all(&day).expect("session dir");
+    write_rollout(&day, &[token_count_event(24_601, 5.0)]);
+
+    // 「本次运行」从现在开始，而那个 rollout 是之前写的。
+    let claimed = super::collect_sessions(home.path(), "acct-a", std::time::SystemTime::now());
+    assert!(claimed.is_empty(), "不认识的历史会话不能算到当前账号头上");
+}
+
+/// 归属表不能无限长下去：扫不到的会话再也不会被上报，留着没有意义。
+#[test]
+fn the_attribution_file_only_keeps_what_is_still_reportable() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let day = home.path().join("sessions/2026/08/03");
+    std::fs::create_dir_all(&day).expect("session dir");
+    write_rollout(&day, &[token_count_event(1_000, 5.0)]);
+    let long_ago = std::time::SystemTime::UNIX_EPOCH;
+    super::collect_sessions(home.path(), "acct-a", long_ago);
+
+    // 会话文件没了，归属记录也该跟着走。
+    std::fs::remove_dir_all(&day).expect("drop the rollout");
+    super::collect_sessions(home.path(), "acct-a", long_ago);
+    let stored = std::fs::read_to_string(home.path().join("pool-sessions.json"))
+        .expect("attribution file");
+    assert_eq!(stored, "{}");
+}
+
 /// 没配就必须返回 None —— 那是「退回上游本地 auth.json」的信号，不是错误。
 #[test]
 fn an_unconfigured_home_leaves_upstream_auth_alone() {
@@ -150,6 +208,16 @@ fn lease_body(account_key: &str) -> serde_json::Value {
             }
         }
     })
+}
+
+/// 把上次决策推到合并窗口之外，等价于「过了一会儿又来一个请求」。
+///
+/// 直接改时钟而不是 sleep：一个真睡一秒的测试没人愿意留着。
+fn next_request(pool: &PoolAuth) {
+    let mut guard = pool.lease.write().expect("lease lock");
+    if let Some(lease) = guard.as_mut() {
+        lease.decided_at = std::time::Instant::now() - super::DECISION_COALESCE;
+    }
 }
 
 fn provider(server: &MockServer) -> (PoolAuth, tempfile::TempDir) {
@@ -212,28 +280,51 @@ async fn the_auth_manager_serves_pool_credentials_with_no_auth_json_on_disk() {
     assert_eq!(auth.get_account_id().as_deref(), Some("acct-pool"));
 }
 
-/// 每取一次凭据就要重新派一次号——**没有本地缓存短路**。
+/// 一次模型调用周围的连锁取凭据只打一个往返。
 ///
-/// 这是整套设计的前提。攥着上一次的结果不问，就意味着手上的号额度跑满、被停用、
-/// 被冷却之后照样继续用，直到某个计时器到点；而"每个请求都判断"要的正是即时。
-/// 稳定性由服务端保证（还能用就原样还回来），不是靠客户端不问。
+/// 上游的 `auth()` 在外部 provider 模式下每次都 `reload()`，围绕一次调用会被调
+/// 几十次。逐个发请求的话服务端会被当成心跳靶子——实测启动阶段 550 毫秒里就有
+/// 十几次。
 #[tokio::test]
-async fn every_credential_fetch_asks_the_pool_again() {
+async fn the_calls_around_one_request_collapse_into_one_pool_call() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/x8Rk3Nq6Vd2/lease"))
         .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-a")))
-        .expect(5)
+        .expect(1)
         .mount(&server)
         .await;
 
     let (pool, _home) = provider(&server);
-    for _ in 0..5 {
+    for _ in 0..20 {
         pool.current(/*allow_stale*/ true)
             .await
             .expect("lease should succeed");
     }
-    // MockServer 在 drop 时校验 expect(5)。
+    // MockServer 在 drop 时校验 expect(1)。
+}
+
+/// 但下一个请求必须重新决策——**没有租约缓存**。
+///
+/// 这是整套设计的前提。攥着上一次的结果不放，就意味着手上的号额度跑满、被停用、
+/// 被冷却之后照样继续用，直到某个计时器到点。合并窗口只吃掉同一个请求内部的重复
+/// 提问，吃不掉两个请求之间的那次决策。
+#[tokio::test]
+async fn the_next_request_gets_a_fresh_decision() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-a")))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let (pool, _home) = provider(&server);
+    pool.current(true).await.expect("first request");
+    // 把上次决策的时刻推到合并窗口之外，等价于「过了一会儿又来一个请求」。
+    // 直接改时钟而不是 sleep：一个真睡一秒的测试没人愿意留着。
+    next_request(&pool);
+    pool.current(true).await.expect("second request");
 }
 
 /// 手上那个号要报给服务端——粘性判断在服务端做，靠的就是这个字段。
@@ -261,6 +352,7 @@ async fn the_held_account_is_sent_back_to_the_pool() {
 
     let (pool, _home) = provider(&server);
     pool.current(true).await.expect("initial lease");
+    next_request(&pool);
     pool.current(true).await.expect("second lease");
 }
 
@@ -277,6 +369,7 @@ async fn an_unreachable_pool_does_not_drop_a_working_lease() {
     let (pool, _home) = provider(&server);
     let first = pool.current(true).await.expect("initial lease");
     server.reset().await;
+    next_request(&pool);
 
     let reused = pool
         .current(/*allow_stale*/ true)

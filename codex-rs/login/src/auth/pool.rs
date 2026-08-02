@@ -44,6 +44,20 @@ const TOKEN_HEADER: &str = "X-Codex-Pool-Token";
 /// 那份凭据（通常还有几十分钟有效期），会话照跑。
 const POOL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 把一次模型调用前后的连锁取凭据合并成一次派号。
+///
+/// **这不是租约缓存。** 上游的 `AuthManager::auth()` 在外部 provider 模式下每次都
+/// 走一遍 `reload()`，而围绕一次模型调用它会被调几十次（实测启动阶段 550 毫秒里
+/// 十几次）。不合并的话一个请求要打几十个往返，服务端被当成心跳靶子。
+///
+/// 窗口取 1 秒是有依据的，不是随手定的：决策**只可能**在有新信息时改变，而新信息
+/// 最快也要 [`USAGE_SCAN_MIN_INTERVAL`]（5 秒）才来一批。真正的模型调用间隔以秒
+/// 计，所以每个请求依然拿到一次全新的决策——被合并掉的全是同一个请求内部的重复
+/// 提问。原来那套是 200 秒，差着两个数量级。
+///
+/// 401 不走这条路：`refresh()` 永远重新问，手上那份刚被对面拒绝。
+const DECISION_COALESCE: Duration = Duration::from_secs(1);
+
 /// 两次扫 rollout 之间至少隔这么久。
 ///
 /// 派号是每个请求一次，扫文件没必要跟着这么密——同一个响应写进 rollout 之后，
@@ -52,15 +66,34 @@ const USAGE_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 没有请求的时候多久主动找一次池子。
 ///
-/// 派号本身挂在请求路径上，安静的时候不需要它。这个心跳是为了**最后一轮的读数**：
-/// 一次 `codex exec` 的最后一次响应写完 rollout 就退出了，没有下一个请求会把它带
-/// 上去。少了这一条，一个号可能停在"96%"的记录上、实际已经 99%，下次被派出去第
-/// 一个请求就 429。顺带也把租约续上。
+/// 派号本身挂在请求路径上，安静的时候不需要它。这个心跳是为了让一个开着不动的
+/// 会话也能把读数报上去，顺带把租约续上。
 const IDLE_TICK: Duration = Duration::from_secs(20);
 
-/// 一次最多扫多少个 rollout。够覆盖一次运行摸过的会话，又不至于在一个跑了很久的
-/// `CODEX_HOME` 上翻几千个文件。
+/// 往回扫多久之内动过的 rollout。
+///
+/// **不能只扫"本次运行开始之后"的。** 一次 `codex exec` 的最后一次响应写完
+/// rollout 就退出了，没有下一个取凭据的调用会把它带上去——只报本次运行的话，
+/// 每次运行都会丢掉最后一轮，而一个只跑一轮的 `codex exec` 就等于**永远报不出
+/// 任何读数**。读数报不出来，服务端对每个号都只能假设满余量，调度直接退化。
+///
+/// 所以扫最近这段时间，让下一次运行把上一次的尾巴带上去。归属靠
+/// [`ATTRIBUTION_FILE`] 记着，不会算到错误的号头上。
+const REPORT_WINDOW_SECONDS: u64 = 6 * 3600;
+
+/// 一次最多扫多少个 rollout。够覆盖最近几次运行摸过的会话，又不至于在一个跑了很久
+/// 的 `CODEX_HOME` 上翻几千个文件。
 const MAX_ROLLOUTS: usize = 20;
+
+/// 会话到账号的归属记录。
+///
+/// 用量的唯一键是 (session_id, account_key)，所以把一个会话记到错误的号头上不是
+/// 覆盖而是**多出一行**，两个号各背一份完整用量。跨运行上报必须知道当初是谁服务
+/// 的，这个文件就是干这个的。
+const ATTRIBUTION_FILE: &str = "pool-sessions.json";
+
+/// 归属表最多留多少条。够覆盖最近几天，又不至于无限长下去。
+const MAX_ATTRIBUTIONS: usize = 500;
 
 /// 我们自己那份配置在 `CODEX_HOME` 下的文件名。
 ///
@@ -183,13 +216,14 @@ fn workspace_tag() -> String {
 struct Lease {
     account_key: String,
     auth: CodexAuth,
+    decided_at: Instant,
 }
 
 /// 上次扫 rollout 的节流状态。
 struct Scan {
-    /// 本次运行开始的时刻。只报这次碰过的会话——同一个 `CODEX_HOME` 里可能躺着
-    /// 几个月的历史，那些属于别的账号，报上去会把用量记到错误的号头上。
-    since: SystemTime,
+    /// 本次运行开始的时刻。决定一个没有归属记录的会话能不能算我们的——见
+    /// [`collect_sessions`] 第 3 条。
+    started: SystemTime,
     next: Instant,
 }
 
@@ -212,7 +246,7 @@ impl PoolAuth {
             codex_home,
             lease: RwLock::new(None),
             scan: RwLock::new(Scan {
-                since: SystemTime::now(),
+                started: SystemTime::now(),
                 next: Instant::now(),
             }),
         }
@@ -224,10 +258,15 @@ impl PoolAuth {
     /// （access token 通常还有十几分钟有效期，一次网络抖动不该打断会话）；凭据
     /// 刚被 401 拒绝时不行——那份已经被对面拒了，再用一次只会再失败一次。
     async fn current(&self, allow_stale: bool) -> std::io::Result<CodexAuth> {
+        if allow_stale
+            && let Some(auth) = self.recent_decision()
+        {
+            return Ok(auth);
+        }
         let held = self.held_account();
-        // 只有手上有号才带用量：一批用量得记在某个号头上，没有号就没有归属。
-        let sessions = match held {
-            Some(_) => self.scan_usage().await,
+        // 只有手上有号才带用量：新出现的会话得记在某个号头上，没有号就没有归属。
+        let sessions = match held.as_deref() {
+            Some(account_key) => self.scan_usage(account_key).await,
             None => Vec::new(),
         };
         let reject = (!allow_stale).then_some(REJECT_UNAUTHORIZED);
@@ -244,13 +283,13 @@ impl PoolAuth {
         }
     }
 
-    /// 扫一遍本次运行产生的 rollout，取出用量和最新的额度读数。
+    /// 扫一遍最近的 rollout，取出用量和额度读数，并记下每个会话归谁。
     ///
     /// 节流到 [`USAGE_SCAN_MIN_INTERVAL`]：派号是每个请求一次，重读几 MB 的会话
     /// 文件没必要跟着这么密。服务端按 (session_id, account_key) 去重、计数取较大
     /// 值，所以少报一轮或重复报都无害。
-    async fn scan_usage(&self) -> Vec<SessionUsage> {
-        let since = {
+    async fn scan_usage(&self, held: &str) -> Vec<SessionUsage> {
+        let started = {
             let Ok(mut guard) = self.scan.write() else {
                 return Vec::new();
             };
@@ -259,11 +298,12 @@ impl PoolAuth {
                 return Vec::new();
             }
             guard.next = now + USAGE_SCAN_MIN_INTERVAL;
-            guard.since
+            guard.started
         };
         let home = self.codex_home.clone();
+        let held = held.to_string();
         // 扫目录和读文件都是阻塞 IO，不能直接压在异步线程上。
-        tokio::task::spawn_blocking(move || collect_sessions(&home, since))
+        tokio::task::spawn_blocking(move || collect_sessions(&home, &held, started))
             .await
             .unwrap_or_default()
     }
@@ -325,9 +365,17 @@ impl PoolAuth {
             *guard = Some(Lease {
                 account_key: data.account_key,
                 auth: auth.clone(),
+                decided_at: Instant::now(),
             });
         }
         Ok(auth)
+    }
+
+    /// 刚刚才决定过的话就用那次的结果。见 [`DECISION_COALESCE`]。
+    fn recent_decision(&self) -> Option<CodexAuth> {
+        let guard = self.lease.read().ok()?;
+        let lease = guard.as_ref()?;
+        (lease.decided_at.elapsed() < DECISION_COALESCE).then(|| lease.auth.clone())
     }
 
     fn cached_auth(&self) -> Option<CodexAuth> {
@@ -403,6 +451,9 @@ struct Tokens {
 #[derive(Serialize, Default, Debug, PartialEq)]
 struct SessionUsage {
     session_id: String,
+    /// 这个会话归哪个号。省略时服务端按请求上的 `account_key` 算。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     requests: u64,
@@ -431,20 +482,86 @@ struct RateWindow {
     resets_at: Option<i64>,
 }
 
-fn collect_sessions(codex_home: &Path, since: SystemTime) -> Vec<SessionUsage> {
-    recent_rollouts(codex_home, since)
-        .into_iter()
-        .filter_map(|path| read_rollout(&path))
-        .collect()
+/// 最近动过的会话，附上各自归属的账号。
+///
+/// 归属三条规则，顺序不能变：
+///
+/// 1. 有记录的沿用记录——一个会话可能是上一次运行、在另一个号上跑的
+/// 2. 没记录、但本次运行动过 → 归手上这个号，并记下来
+/// 3. 没记录、本次运行也没动过 → **整条丢掉**
+///
+/// 第 3 条不能省。同一个 `CODEX_HOME` 里躺着装池子之前的历史、以及用户自己
+/// `codex login` 跑的会话；认领它们等于把一整份用量凭空记到当前这个号头上。
+/// 用量唯一键是 (session_id, account_key)，那不是覆盖而是多出一整行——真机第一
+/// 次跑就撞上了，一个池子建立之前的会话被记了 24601 个 token。
+fn collect_sessions(codex_home: &Path, held: &str, started: SystemTime) -> Vec<SessionUsage> {
+    let mut owners = load_attribution(codex_home);
+    let mut sessions = Vec::new();
+    for (modified, path) in recent_rollouts(codex_home) {
+        let Some(mut usage) = read_rollout(&path) else {
+            continue;
+        };
+        let owner = match owners.get(&usage.session_id) {
+            Some(owner) => owner.clone(),
+            None if modified >= started => {
+                owners.insert(usage.session_id.clone(), held.to_string());
+                held.to_string()
+            }
+            None => continue,
+        };
+        usage.account_key = Some(owner);
+        sessions.push(usage);
+    }
+    save_attribution(codex_home, &owners, &sessions);
+    sessions
 }
 
-/// 本次运行碰过的 rollout，最新的在前。
-fn recent_rollouts(codex_home: &Path, since: SystemTime) -> Vec<PathBuf> {
+/// 最近动过的 rollout，最新的在前，带上各自的修改时间。
+fn recent_rollouts(codex_home: &Path) -> Vec<(SystemTime, PathBuf)> {
+    let since = SystemTime::now()
+        .checked_sub(Duration::from_secs(REPORT_WINDOW_SECONDS))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut found = Vec::new();
     collect_rollouts(&codex_home.join("sessions"), since, 0, &mut found);
     found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     found.truncate(MAX_ROLLOUTS);
-    found.into_iter().map(|(_, path)| path).collect()
+    found
+}
+
+fn attribution_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(ATTRIBUTION_FILE)
+}
+
+fn load_attribution(codex_home: &Path) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(attribution_path(codex_home))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// 存回归属表，只留最近扫到的那些。
+///
+/// 按「这一批扫到了什么」裁剪而不是按条数裁：扫的范围本来就是最近这段时间，超出
+/// 那个范围的会话再也不会被上报，留着只会让文件无限长下去。
+fn save_attribution(
+    codex_home: &Path,
+    owners: &std::collections::HashMap<String, String>,
+    sessions: &[SessionUsage],
+) {
+    let kept: std::collections::HashMap<&str, &str> = sessions
+        .iter()
+        .take(MAX_ATTRIBUTIONS)
+        .filter_map(|usage| {
+            owners
+                .get(&usage.session_id)
+                .map(|owner| (usage.session_id.as_str(), owner.as_str()))
+        })
+        .collect();
+    let Ok(body) = serde_json::to_string(&kept) else {
+        return;
+    };
+    // 写不进去不影响这次上报，下次再试。
+    let _ = std::fs::write(attribution_path(codex_home), body);
 }
 
 fn collect_rollouts(dir: &Path, since: SystemTime, depth: usize, out: &mut Vec<(SystemTime, PathBuf)>) {
