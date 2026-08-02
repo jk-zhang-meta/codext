@@ -1,0 +1,10 @@
+# 运行时产物不进规范源，构建一律在 ~/.agent-work 的镜像里做。
+# Rust target/ 单独就有好几个 GB，同步上去会把 OneDrive 拖垮。
+target/
+codex-rs/target/
+node_modules/
+.venv/
+dist/
+bazel-*
+*.rlib
+*.rmeta

@@ -2303,9 +2303,9 @@ impl AuthManager {
         keyring_backend_kind: AuthKeyringBackendKind,
         auth_route_config: AuthRouteConfig,
     ) -> Arc<Self> {
-        Arc::new(
+        let manager = Arc::new(
             Self::new(
-                codex_home,
+                codex_home.clone(),
                 enable_codex_api_key_env,
                 auth_credentials_store_mode,
                 forced_chatgpt_workspace_id,
@@ -2314,7 +2314,9 @@ impl AuthManager {
                 auth_route_config,
             )
             .await,
-        )
+        );
+        super::pool::install_if_configured(&manager, &codex_home).await;
+        manager
     }
 
     /// Convenience constructor returning an `Arc` wrapper from resolved config.

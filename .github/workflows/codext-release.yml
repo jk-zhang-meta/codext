@@ -1,0 +1,104 @@
+# Publish a codext release.
+#
+# Deliberately not a fork of upstream's `rust-release.yml`: that one builds on
+# self-hosted runners this repository does not have, signs and notarizes, and
+# publishes npm and Homebrew artifacts. Editing it down would leave a large
+# file whose diff against upstream grows with every upstream change, and
+# keeping merges clean is the whole reason this fork exists. A new file with
+# its own name never conflicts.
+#
+# The asset names are the contract with `ags update`, which looks for
+# `codext-<target>.tar.gz` containing a single executable called `codext`.
+name: codext release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to publish
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel; installing the target separately
+      # is still needed because rustup only fetches the host one by default.
+      - name: Install the Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # musl needs its own linker and OpenSSL is built from source against it.
+      - if: endsWith(matrix.target, '-linux-musl')
+        name: Install musl build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+
+      - name: Build
+        working-directory: codex-rs
+        run: cargo build --release --target ${{ matrix.target }} -p codex-cli
+
+      # The upstream binary is called `codex`. Renaming it here rather than in
+      # Cargo.toml keeps `[[bin]]` identical to upstream, so the rename never
+      # shows up as a merge conflict.
+      - name: Package
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/codex" "$staging/codext"
+          chmod 755 "$staging/codext"
+          tar -czf "codext-${{ matrix.target }}.tar.gz" -C "$staging" codext
+          shasum -a 256 "codext-${{ matrix.target }}.tar.gz" \
+            > "codext-${{ matrix.target }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codext-${{ matrix.target }}
+          path: |
+            codex-rs/codext-${{ matrix.target }}.tar.gz
+            codex-rs/codext-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes "codext $TAG — Codex with the PersonalWeb credential pool." \
+            assets/* \
+            || gh release upload "$TAG" --repo "${{ github.repository }}" \
+                 --clobber assets/*
