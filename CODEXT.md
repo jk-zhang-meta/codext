@@ -2,7 +2,7 @@
 
 `openai/codex` 的私有分叉。基线 `rust-v0.146.0`，分支 `codext`，上游远端名 `upstream`。
 
-存在的唯一理由：**让 Codex 的凭据来自 PersonalWeb 账号池，而不是本机的
+存在的唯一理由：**让 Codex 的凭据来自一个自建的账号池服务，而不是本机的
 `auth.json`**。一个人跑很多项目，用量摊在若干个账号上，谁都不像机器。
 
 ## 上游footprint：两个文件，三个挂钩点
@@ -261,7 +261,7 @@ N 个正常用户。安全和公平在这里是同一个方向。
 环境变量优先，其次 `CODEX_HOME/pool.json`：
 
 ```json
-{"base_url": "https://www.itachi.fans:844", "key": "cxk_…"}
+{"base_url": "https://pool.example.com:844", "key": "cxk_…"}
 ```
 
 ```

@@ -15,13 +15,13 @@ fn the_pool_is_configurable_without_environment_variables() {
     let home = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         home.path().join("pool.json"),
-        r#"{"base_url": "https://www.itachi.fans:844/", "key": "  k-123  "}"#,
+        r#"{"base_url": "https://pool.example.com:844/", "key": "  k-123  "}"#,
     )
     .expect("write config");
 
     let config = Config::load(home.path()).expect("config should be found");
     // 末尾斜杠会和拼接出来的路径前缀撞成 `//`，密钥两头的空白会被原样发出去。
-    assert_eq!(config.base_url, "https://www.itachi.fans:844");
+    assert_eq!(config.base_url, "https://pool.example.com:844");
     assert_eq!(config.key, "k-123");
 }
 

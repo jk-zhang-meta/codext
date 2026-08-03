@@ -1,4 +1,4 @@
-//! 从 PersonalWeb 账号池在线租借 Codex 凭据，替代本机 `auth.json`。
+//! 从自建的账号池服务在线租借 Codex 凭据，替代本机 `auth.json`。
 //!
 //! 挂在上游的 `ExternalAuth` 扩展点上。`AuthManager::load_auth()` 会优先问这里，
 //! 而 `auth()` 每次取凭据都会重新 resolve 一遍，所以换号既不用动任何文件、也不

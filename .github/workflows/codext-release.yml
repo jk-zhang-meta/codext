@@ -18,10 +18,14 @@
 # builds apart by the asset digest, not by the tag.
 name: codext release
 
+# 只接受手动触发。曾经是 `on: push: tags: ["v*"]`,但 GitHub 的运行器是 4 vCPU
+# (Linux) 和 3 vCPU / 7 GB (macOS),实测一轮 1 小时 2 分,而同样的代码在自己的
+# 32 核开发机和 M3 Max 上是几分钟的事。`publish` 又是 `needs: build`,慢的那条会
+# 把整个发布卡住——包括已经编好的那条。
+#
+# 默认路径见 RELEASING.md:本地编、本地打包、`gh release upload --clobber`。
+# 这个工作流留着是为了应急:手边没有 Apple Silicon 机器的时候还能出 macOS 包。
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -116,7 +120,7 @@ jobs:
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "$TAG" \
-            --notes "codext $TAG — Codex with the PersonalWeb credential pool." \
+            --notes "codext $TAG — Codex with the hosted credential pool." \
             assets/* \
             || gh release upload "$TAG" --repo "${{ github.repository }}" \
                  --clobber assets/*
