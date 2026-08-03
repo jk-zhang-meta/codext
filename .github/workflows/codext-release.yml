@@ -9,6 +9,13 @@
 #
 # The asset names are the contract with `ags update`, which looks for
 # `codext-<target>.tar.gz` containing a single executable called `codext`.
+#
+# The tag is the upstream Codex version and nothing else — codext reports that
+# version because it *is* that version, plus a credential pool. So a second
+# build on one upstream base reuses the tag rather than inventing a suffix, and
+# this runs on a force-pushed tag as readily as a new one. That is what the
+# `create || upload --clobber` at the bottom is for; `ags update` tells the two
+# builds apart by the asset digest, not by the tag.
 name: codext release
 
 on:

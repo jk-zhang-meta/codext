@@ -241,3 +241,28 @@ cargo build --release -p codex-cli        # 产物叫 codex，发布时改名 co
 
 `mw sync` 之后**核对一下测试数量**：rsync 保留 mtime，DrvFs 的时间戳可能比构建
 产物还旧，cargo 会跳过重编。测试数没涨就是没同步上。
+
+## 发布
+
+**codext 的版本号就是它基于的 codex 版本号，一个字符都不加。** `codext
+--version` 报 `codex-cli 0.146.0`，因为它就是 0.146.0 的 codex 加了个凭据池。
+任何读 codex 版本号的东西——上游的兼容性判断、`ags`、脚本、人——读 codext 必须
+得到同样的答案。所以 tag 永远是 `v<上游版本>`：没有 `-2`，没有 `+ours`，没有
+任何后缀。
+
+同一个上游基线上再发一版，**不是**开新 tag，是把旧 tag 挪过来重发：
+
+```
+git tag -f v0.146.0 <新 commit>
+git push -f origin v0.146.0
+```
+
+强制推 tag 照样触发 `codext-release.yml`（push 事件对 tag 的更新一样发），
+工作流里 `gh release create ... || gh release upload --clobber` 就是为这条路径
+写的：release 已经在了就把资产覆盖掉。真没触发就手动 `workflow_dispatch`，
+它收一个 tag 参数。
+
+版本号既然不动，`ags update` 就不能靠 tag 判断新旧。它比对的是 release 资产的
+sha256 digest（GitHub API 的 `.assets[].digest`），记在
+`~/.local/state/ags/codext-release`。字节没变就不重装——重编出一模一样的产物
+不会让谁白下一遍。
