@@ -155,8 +155,10 @@ struct StoredConfig {
 impl Config {
     /// 环境变量优先，其次 `CODEX_HOME/pool.json`。
     ///
-    /// 环境变量在前，是因为 ags 启动 codext 时就是这么把地址和密钥递进来的；
-    /// 文件是给「不经 ags、直接跑 codext」准备的。两处都没有就返回 None。
+    /// 常规路径是**文件**：`ags codex-init` 把地址和密钥一次性写进
+    /// `CODEX_HOME/pool.json`，之后 ags 启动 codext 时只是继承环境，不传任何池子
+    /// 的环境变量。环境变量放在前面是留一个一次性覆盖的口子（临时换个池子、CI），
+    /// 不是常规来源。两处都没有就返回 None。
     fn load(codex_home: &Path) -> Option<Self> {
         let stored = std::fs::read_to_string(codex_home.join(CONFIG_FILE))
             .ok()
