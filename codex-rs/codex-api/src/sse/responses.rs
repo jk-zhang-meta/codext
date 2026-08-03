@@ -641,6 +641,9 @@ fn is_cyber_policy_error(error: &Error) -> bool {
 fn is_server_overloaded_error(error: &Error) -> bool {
     error.code.as_deref() == Some("server_is_overloaded")
         || error.code.as_deref() == Some("slow_down")
+        || error.message.as_deref().is_some_and(|message| {
+            message == "Selected model is at capacity. Please try a different model."
+        })
 }
 
 fn cyber_policy_fallback_message() -> String {
@@ -1642,6 +1645,36 @@ mod tests {
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs_f64(1.898)));
+    }
+
+    #[test]
+    fn model_capacity_message_is_treated_as_server_overloaded() {
+        let err = Error {
+            r#type: None,
+            message: Some(
+                "Selected model is at capacity. Please try a different model.".to_string(),
+            ),
+            code: None,
+            plan_type: None,
+            resets_at: None,
+        };
+
+        assert!(is_server_overloaded_error(&err));
+    }
+
+    #[test]
+    fn similar_model_capacity_message_is_not_treated_as_server_overloaded() {
+        let err = Error {
+            r#type: None,
+            message: Some(
+                "Proxy: Selected model is at capacity. Please try a different model.".to_string(),
+            ),
+            code: None,
+            plan_type: None,
+            resets_at: None,
+        };
+
+        assert!(!is_server_overloaded_error(&err));
     }
 
     #[test]

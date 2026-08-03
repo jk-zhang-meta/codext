@@ -299,6 +299,12 @@ struct WebsocketSession {
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
     connection_reused: StdMutex<bool>,
+    /// codext: 这条连接是用哪个 ChatGPT 账号建立的。
+    ///
+    /// 上游只有一种换凭据的情形——401 之后续期，账号身份不变，所以复用连接一直是
+    /// 安全的。凭据改成从账号池在线租借之后不再成立：额度耗尽重试时会换成**另一个
+    /// 账号**，而连接是按"还开着就复用"判断的，新凭据会被直接丢掉。
+    account: Option<String>,
 }
 
 // This is intentionally not a `PartialEq` implementation: request equality includes `input` and
@@ -1561,6 +1567,25 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
+            // codext: 账号变了就必须把连接丢掉重连。
+            //
+            // 下面的 `websocket_connection` 只在连接已关闭时才拿 `api_auth` 重连；
+            // 连接还开着它就走复用分支，把刚租来的新凭据原样丢弃——于是"额度耗尽换
+            // 个号重试"在 websocket 传输上完全不生效，请求仍然从那个已经跑满的账号
+            // 发出去，一直撞到重试次数用尽、传输降级成 HTTPS 为止。
+            //
+            // 连带清掉 `last_request`（`previous_response_id` 指向的是旧账号名下存
+            // 的那次响应）和 turn state 头：这两样都是按账号绑定的，跨账号重放要么
+            // 被拒、要么把一个账号的会话状态带到另一个账号上。
+            let leased_account = client_setup.auth.as_ref().and_then(CodexAuth::get_account_id);
+            if self.websocket_session.account.is_some()
+                && self.websocket_session.account != leased_account
+            {
+                self.reset_websocket_session();
+                self.turn_state = Arc::new(OnceLock::new());
+            }
+            self.websocket_session.account = leased_account;
+
             let mut client_metadata = self
                 .client
                 .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);

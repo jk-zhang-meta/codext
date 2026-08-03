@@ -3599,12 +3599,15 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         })
     );
 
-    let error_event = wait_for_event(&codex, |msg| matches!(msg, EventMsg::Error(_))).await;
-    let EventMsg::Error(error_event) = error_event else {
+    // codext: 额度耗尽不再终结这一轮。读数照报——上面那段才是这个测试名字所指的东
+    // 西——然后会话说一次话，接着无限等下去。这台机器没配账号池，没有号可换，所以
+    // 等的是它自己那个窗口重置。
+    let error_event = wait_for_event(&codex, |msg| matches!(msg, EventMsg::StreamError(_))).await;
+    let EventMsg::StreamError(error_event) = error_event else {
         unreachable!();
     };
     assert!(
-        error_event.message.contains("spend cap set by the owner"),
+        error_event.message.contains("Retrying indefinitely"),
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
     );
@@ -3714,6 +3717,55 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_capacity_retries_with_zero_stream_retry_budget() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    // Deliberately omit an overload code: this exercises the exact-message
+    // classification all the way through the real SSE retry loop.
+    let capacity = sse(vec![json!({
+        "type": "response.failed",
+        "response": {
+            "id": "resp_capacity",
+            "error": {
+                "message": "Selected model is at capacity. Please try a different model."
+            }
+        }
+    })]);
+    let completed = sse(vec![
+        ev_response_created("resp_ok"),
+        ev_completed("resp_ok"),
+    ]);
+    let responses_mock = mount_sse_sequence(&server, vec![capacity, completed]).await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            config.model_provider.supports_websockets = false;
+        })
+        .build(&server)
+        .await?;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "trigger model capacity retry".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert_eq!(responses_mock.requests().len(), 2);
     Ok(())
 }
 

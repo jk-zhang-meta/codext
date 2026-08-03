@@ -67,6 +67,28 @@ fn token_count_event(total: u64, used_percent: f64) -> serde_json::Value {
     })
 }
 
+fn incremental_token_count_event(total: u64, last: u64) -> serde_json::Value {
+    serde_json::json!({
+        "timestamp": "2026-08-03T00:00:00.000Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": total, "cached_input_tokens": 0,
+                    "output_tokens": 0, "reasoning_output_tokens": 0,
+                    "total_tokens": total,
+                },
+                "last_token_usage": {
+                    "input_tokens": last, "cached_input_tokens": 0,
+                    "output_tokens": 0, "reasoning_output_tokens": 0,
+                    "total_tokens": last,
+                },
+            },
+        },
+    })
+}
+
 /// 累计量取**最后一条**事件，不是把每条加起来。
 ///
 /// `total_token_usage` 本身就是会话累计值，相加等于把消耗乘以回合数——一个长会话
@@ -76,7 +98,10 @@ fn session_totals_come_from_the_last_event_not_the_sum() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = write_rollout(
         dir.path(),
-        &[token_count_event(1_000, 5.0), token_count_event(2_500, 12.5)],
+        &[
+            token_count_event(1_000, 5.0),
+            token_count_event(2_500, 12.5),
+        ],
     );
 
     let usage = super::read_rollout(&path).expect("rollout should parse");
@@ -89,6 +114,70 @@ fn session_totals_come_from_the_last_event_not_the_sum() {
     assert_eq!(limits.windows[0].used_percent, 12.5);
     assert_eq!(limits.windows[0].window_minutes, 300);
     assert_eq!(limits.windows[1].window_minutes, 10080);
+}
+
+/// 子线程第一条累计量带着父线程历史；重复快照也不是第二次请求。
+#[test]
+fn incremental_usage_excludes_inherited_baseline_and_duplicate_snapshots() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = incremental_token_count_event(1_000_100, 100);
+    let path = write_rollout(
+        dir.path(),
+        &[
+            serde_json::json!({
+                "timestamp": "2026-08-03T00:00:00.000Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.6-sol"},
+            }),
+            first.clone(),
+            first,
+            incremental_token_count_event(1_000_350, 250),
+        ],
+    );
+
+    let usage = super::read_rollout(&path).expect("rollout should parse");
+    assert_eq!(usage.counter_version, 2);
+    assert_eq!(usage.requests, 2, "重复快照不能多算一次请求");
+    assert_eq!(usage.total_tokens, 350, "父线程的百万 token 基线不能算进来");
+    assert_eq!(usage.input_tokens, 350);
+    assert_eq!(usage.model.as_deref(), Some("gpt-5.6-sol"));
+}
+
+#[test]
+fn null_info_does_not_disable_incremental_accounting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_rollout(
+        dir.path(),
+        &[
+            incremental_token_count_event(1_000_100, 100),
+            serde_json::json!({
+                "timestamp": "2026-08-03T00:00:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": null,
+                    "rate_limits": {
+                        "plan_type": "plus",
+                        "primary": {
+                            "window_minutes": 300,
+                            "used_percent": 33.0,
+                            "resets_at": 1786000000
+                        },
+                        "secondary": null
+                    }
+                }
+            }),
+            incremental_token_count_event(1_000_350, 250),
+        ],
+    );
+
+    let usage = super::read_rollout(&path).expect("rollout should parse");
+    assert_eq!(usage.requests, 2);
+    assert_eq!(usage.total_tokens, 350);
+    assert_eq!(
+        usage.rate_limits.expect("rate limit snapshot").windows[0].used_percent,
+        33.0
+    );
 }
 
 /// 两次刷新之间 OpenAI 会发全 null 的窗口。那不是"用量为零"，不能当读数报上去
@@ -110,7 +199,10 @@ fn all_null_windows_do_not_become_a_zero_usage_reading() {
 
     let usage = super::read_rollout(&path).expect("rollout should parse");
     assert_eq!(usage.requests, 1);
-    assert!(usage.rate_limits.is_none(), "全 null 的窗口不能变成一条读数");
+    assert!(
+        usage.rate_limits.is_none(),
+        "全 null 的窗口不能变成一条读数"
+    );
 }
 
 /// 已经归属过的会话不能改记到现在这个号头上。
@@ -127,13 +219,154 @@ fn a_session_keeps_the_account_that_actually_served_it() {
     write_rollout(&day, &[token_count_event(1_000, 5.0)]);
 
     let long_ago = std::time::SystemTime::UNIX_EPOCH;
-    let first = super::collect_sessions(home.path(), "acct-a", long_ago);
+    let first = super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].account_key.as_deref(), Some("acct-a"));
 
     // 下一次运行手上是另一个号，但这个会话是 acct-a 跑的。
-    let again = super::collect_sessions(home.path(), "acct-b", std::time::SystemTime::now());
+    let again = super::collect_sessions(
+        home.path(),
+        Some("acct-b"),
+        std::time::SystemTime::now(),
+        None,
+    );
     assert_eq!(again[0].account_key.as_deref(), Some("acct-a"));
+}
+
+#[test]
+fn legacy_string_attribution_migrates_without_reassigning_old_usage() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let day = home.path().join("sessions/2026/08/03");
+    std::fs::create_dir_all(&day).expect("session dir");
+    let path = write_rollout(&day, &[incremental_token_count_event(350, 350)]);
+    let session_id = super::rollout_session_id(&path);
+    let legacy = std::collections::HashMap::from([(session_id, "acct-a")]);
+    std::fs::write(
+        super::attribution_path(home.path()),
+        serde_json::to_string(&legacy).expect("serialize legacy attribution"),
+    )
+    .expect("write legacy attribution");
+
+    // 新版本第一次看到旧的字符串归属时，历史 350 全留在 A；当前持有的 B 只
+    // 接收迁移之后产生的 delta。
+    let long_ago = std::time::SystemTime::UNIX_EPOCH;
+    let migrated = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
+    let a = migrated
+        .iter()
+        .find(|usage| usage.account_key.as_deref() == Some("acct-a"))
+        .expect("legacy acct-a segment");
+    assert_eq!((a.requests, a.total_tokens), (1, 350));
+
+    write_rollout(
+        &day,
+        &[
+            incremental_token_count_event(350, 350),
+            incremental_token_count_event(400, 50),
+        ],
+    );
+    let after = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
+    let by_account: std::collections::HashMap<_, _> = after
+        .iter()
+        .map(|usage| {
+            (
+                usage.account_key.as_deref().expect("account"),
+                (usage.requests, usage.total_tokens),
+            )
+        })
+        .collect();
+    assert_eq!(by_account["acct-a"], (1, 350));
+    assert_eq!(by_account["acct-b"], (1, 50));
+}
+
+#[test]
+fn one_rollout_is_split_across_account_transitions() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let day = home.path().join("sessions/2026/08/03");
+    std::fs::create_dir_all(&day).expect("session dir");
+    let long_ago = std::time::SystemTime::UNIX_EPOCH;
+
+    write_rollout(&day, &[]);
+    super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
+    write_rollout(&day, &[incremental_token_count_event(100, 100)]);
+    super::collect_sessions(home.path(), Some("acct-a"), long_ago, Some(Some("acct-b")));
+
+    write_rollout(
+        &day,
+        &[
+            incremental_token_count_event(100, 100),
+            incremental_token_count_event(350, 250),
+        ],
+    );
+    let segments = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
+    let by_account: std::collections::HashMap<_, _> = segments
+        .iter()
+        .map(|usage| {
+            (
+                usage.account_key.as_deref().expect("account"),
+                (usage.requests, usage.total_tokens),
+            )
+        })
+        .collect();
+    assert_eq!(by_account["acct-a"], (1, 100));
+    assert_eq!(by_account["acct-b"], (1, 250));
+
+    write_rollout(
+        &day,
+        &[
+            incremental_token_count_event(100, 100),
+            incremental_token_count_event(350, 250),
+            incremental_token_count_event(400, 50),
+        ],
+    );
+    let segments = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
+    let b = segments
+        .iter()
+        .find(|usage| usage.account_key.as_deref() == Some("acct-b"))
+        .expect("acct-b segment");
+    assert_eq!((b.requests, b.total_tokens), (2, 300));
+}
+
+#[test]
+fn local_auth_gap_is_not_charged_to_pool_accounts() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let day = home.path().join("sessions/2026/08/03");
+    std::fs::create_dir_all(&day).expect("session dir");
+    let long_ago = std::time::SystemTime::UNIX_EPOCH;
+
+    write_rollout(&day, &[incremental_token_count_event(100, 100)]);
+    super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
+    super::collect_sessions(home.path(), Some("acct-a"), long_ago, Some(None));
+
+    write_rollout(
+        &day,
+        &[
+            incremental_token_count_event(100, 100),
+            incremental_token_count_event(150, 50),
+        ],
+    );
+    super::collect_sessions(home.path(), None, long_ago, None);
+    super::collect_sessions(home.path(), None, long_ago, Some(Some("acct-b")));
+
+    write_rollout(
+        &day,
+        &[
+            incremental_token_count_event(100, 100),
+            incremental_token_count_event(150, 50),
+            incremental_token_count_event(175, 25),
+        ],
+    );
+    let segments = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
+    let by_account: std::collections::HashMap<_, _> = segments
+        .iter()
+        .map(|usage| {
+            (
+                usage.account_key.as_deref().expect("account"),
+                usage.total_tokens,
+            )
+        })
+        .collect();
+    assert_eq!(by_account["acct-a"], 100);
+    assert_eq!(by_account["acct-b"], 25);
 }
 
 /// 归属要在**还没有用量**的时候就落下。
@@ -155,13 +388,13 @@ fn a_session_is_claimed_before_it_has_any_usage() {
     );
     let long_ago = std::time::SystemTime::UNIX_EPOCH;
     assert!(
-        super::collect_sessions(home.path(), "acct-a", long_ago).is_empty(),
+        super::collect_sessions(home.path(), Some("acct-a"), long_ago, None).is_empty(),
         "还没有用量，这一轮不该报任何东西"
     );
 
     // 响应回来了，rollout 补上 token_count。此刻「本次运行」已经是新的一次了。
     write_rollout(&day, &[token_count_event(1_000, 5.0)]);
-    let later = super::collect_sessions(home.path(), "acct-b", std::time::SystemTime::now());
+    let later = super::collect_sessions(home.path(), None, std::time::SystemTime::now(), None);
     assert_eq!(later.len(), 1, "上一次运行的尾巴必须补得上来");
     assert_eq!(later[0].account_key.as_deref(), Some("acct-a"));
 }
@@ -179,7 +412,12 @@ fn a_session_from_before_the_pool_is_not_claimed() {
     write_rollout(&day, &[token_count_event(24_601, 5.0)]);
 
     // 「本次运行」从现在开始，而那个 rollout 是之前写的。
-    let claimed = super::collect_sessions(home.path(), "acct-a", std::time::SystemTime::now());
+    let claimed = super::collect_sessions(
+        home.path(),
+        Some("acct-a"),
+        std::time::SystemTime::now(),
+        None,
+    );
     assert!(claimed.is_empty(), "不认识的历史会话不能算到当前账号头上");
 }
 
@@ -191,13 +429,13 @@ fn the_attribution_file_only_keeps_what_is_still_reportable() {
     std::fs::create_dir_all(&day).expect("session dir");
     write_rollout(&day, &[token_count_event(1_000, 5.0)]);
     let long_ago = std::time::SystemTime::UNIX_EPOCH;
-    super::collect_sessions(home.path(), "acct-a", long_ago);
+    super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
 
     // 会话文件没了，归属记录也该跟着走。
     std::fs::remove_dir_all(&day).expect("drop the rollout");
-    super::collect_sessions(home.path(), "acct-a", long_ago);
-    let stored = std::fs::read_to_string(home.path().join("pool-sessions.json"))
-        .expect("attribution file");
+    super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
+    let stored =
+        std::fs::read_to_string(home.path().join("pool-sessions.json")).expect("attribution file");
     assert_eq!(stored, "{}");
 }
 

@@ -1558,12 +1558,16 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         })
     );
 
-    let error_event = wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::Error(_))).await;
-    let EventMsg::Error(error_event) = error_event else {
+    // codext: 额度耗尽不再终结这一轮，`stream_max_retries` 也压不住它——那是这套东西
+    // 存在的理由。读数照报（上面那段才是这个测试名字所指的东西），然后会话说一次话，
+    // 接着无限等下去。
+    let error_event =
+        wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::StreamError(_))).await;
+    let EventMsg::StreamError(error_event) = error_event else {
         unreachable!();
     };
     assert!(
-        error_event.message.contains("spend cap set by the owner"),
+        error_event.message.contains("Retrying indefinitely"),
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
     );
