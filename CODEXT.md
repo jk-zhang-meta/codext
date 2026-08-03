@@ -5,19 +5,23 @@
 存在的唯一理由：**让 Codex 的凭据来自 PersonalWeb 账号池，而不是本机的
 `auth.json`**。一个人跑很多项目，用量摊在若干个账号上，谁都不像机器。
 
-## 上游footprint：两个文件，8 行
+## 上游footprint：两个文件，三个挂钩点
 
-| 文件 | 改动 |
-| --- | --- |
-| `codex-rs/login/src/auth/mod.rs` | `mod pool;` |
-| `codex-rs/login/src/auth/manager.rs` | `AuthManager::shared()` 里装 provider |
-| `codex-rs/login/src/auth/pool.rs` | 新文件，全部实现 |
-| `codex-rs/login/src/auth/pool_tests.rs` | 新文件 |
+| 文件 | 改动 | 近 5 版上游改动次数 |
+| --- | --- | --- |
+| `codex-rs/login/src/auth/mod.rs` | `mod pool;` | 1 |
+| `codex-rs/login/src/auth/manager.rs` `shared()` | 装 provider | **0** |
+| `codex-rs/login/src/auth/manager.rs` `load_auth()` | 池子给不出号时退回本地 | 3 |
+| `codex-rs/login/src/auth/manager.rs` 续期分流 | 本地那份走本地续期 | 3 |
+| `codex-rs/login/src/auth/pool.rs` | 新文件，全部实现 | — |
+| `codex-rs/login/src/auth/pool_tests.rs` | 新文件 | — |
 
 没有新增依赖，没有动 `Cargo.toml`。
 
 挂钩点是按**函数级** churn 选的，不是文件级：`manager.rs` 在最近 5 个 release
-里改了 14 次，但 `shared()` 一次没改过。
+里改了 14 次，但 `shared()` 一次没改过。后两个挂钩点在 `load_auth()` 附近，那里
+近 5 版动过 3 次（含一次 "unify external auth resolution" 的重构），合并上游时
+优先核对它们。
 
 ```
 git log -L :shared:codex-rs/login/src/auth/manager.rs --oneline rust-v0.142.0..rust-v0.146.0
@@ -135,6 +139,39 @@ score(a) = headroom(a, horizon=600) / (1 + holders(a))
 
 一次 `codex exec` 的最后一次响应写完 rollout 就退出了，没有下一个请求会把它带
 上去。所以有个 20 秒的空闲心跳，走的是同一个 `current()`，不是第二套上报逻辑。
+
+### 池子给不出号时退回本机 auth.json
+
+**池子优先，永远先问池子；问不出来才退回本地。** 这是每次取凭据的降级，不是切换：
+provider 一直装着，下一次照样先问池子，号一回来立刻切回去。
+
+区分两种"给不出"，处置不一样：
+
+| 情况 | 处置 |
+| --- | --- |
+| 连不上，手上还有租约 | 继续用手上那份（几十毫秒的抖动不该打断会话） |
+| 连不上，手上没有租约 | 退回本机 `auth.json` |
+| 服务端明确回 `data: null` | **丢掉手上那份**，退回本机 `auth.json` |
+
+第三行是关键。`data: null` 说明服务端不打算再发手上这个号了——它额度到顶、被停用
+或在冷却。继续骑着只会一路 429，而 429 不触发 `refresh()`，永远逃不出来。所以这条
+路上不复用旧租约，并且把它从内存里删掉：留着的话下一个请求还会把它当作"我手上的
+号"报上去，连带把退回本地之后跑掉的用量和额度读数记到它头上，污染调度用的读数。
+
+两个实现细节，不写下来下次会重新踩：
+
+- 池子发的凭据被 `commit_external_auth` 镜像进了进程内的 **Ephemeral 存储**，而
+  上游的本地加载**优先读它**。退回本地时必须先把它删掉，否则拿回的还是刚刚用不了
+  的那份，等于没退。
+- 续期按**手上这份是谁发的**分流，不能按"装没装 provider"。退回的那份是本机
+  `CodexAuth::Chatgpt`，自带 refresh token，只能走上游的本地续期；按 provider 判
+  的话它会被送去问池子，而池子正是刚才给不出号的那个。判据是
+  `!matches!(auth, CodexAuth::Chatgpt(_))`——bearer provider 发的 `Headers` 凭据
+  仍归 provider 续，别收窄成 `is_external_chatgpt_tokens()`，那会打断上游的 bearer
+  路径（有测试盯着）。
+
+主动续期没做：`auth()` 在 provider 模式下跳过 `should_refresh_proactively`，所以
+退回本地之后那份凭据要等一次 401 才被动续期。多一个往返，够用了。
 
 ### 配额耗尽不需要终端报告
 

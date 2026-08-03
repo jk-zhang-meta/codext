@@ -102,6 +102,9 @@ const MAX_ATTRIBUTIONS: usize = 500;
 const CONFIG_FILE: &str = "pool.json";
 
 /// 配了池子就接管凭据来源；没配就什么都不做，codext 退回上游原本的 auth.json。
+///
+/// 配了也不等于绑死：池子给不出号的时候 `AuthManager::load_auth` 会退回本机
+/// auth.json，见那里的注释。
 pub(super) async fn install_if_configured(manager: &Arc<AuthManager>, codex_home: &Path) {
     let Some(config) = Config::load(codex_home) else {
         return;
@@ -271,7 +274,15 @@ impl PoolAuth {
         };
         let reject = (!allow_stale).then_some(REJECT_UNAUTHORIZED);
         match self.post(held.as_deref(), reject, sessions).await {
-            Ok(data) => self.store(data),
+            Ok(Some(data)) => self.store(data),
+            // 「此刻没号可发」是确定的答复，不是抖动：手上那份多半正是服务端刚决定
+            // 不再发的那个号（额度到顶、被停用、被冷却），继续骑着只会一路撞墙。所以
+            // 这里**不复用**旧租约，报上去让 `AuthManager::load_auth` 退回本机
+            // auth.json；下一个请求照样会再问池子一次，号一回来就自动切回去。
+            Ok(None) => {
+                self.forget_lease();
+                Err(std::io::Error::other("no account available in the pool"))
+            }
             Err(err) if allow_stale => match self.cached_auth() {
                 Some(auth) => {
                     tracing::warn!("codext: pool unreachable, reusing the current lease: {err}");
@@ -308,12 +319,14 @@ impl PoolAuth {
             .unwrap_or_default()
     }
 
+    /// 向池子要一个号。`Ok(None)` 是「此刻没号可发」——那是服务端的正常答复，
+    /// 和「联系不上」不是一回事，两者的处置也不一样，见 [`PoolAuth::current`]。
     async fn post(
         &self,
         account_key: Option<&str>,
         reject: Option<&str>,
         sessions: Vec<SessionUsage>,
-    ) -> std::io::Result<LeaseData> {
+    ) -> std::io::Result<Option<LeaseData>> {
         let url = format!("{}{PATH_PREFIX}/lease", self.config.base_url);
         let response = self
             .client
@@ -345,11 +358,7 @@ impl PoolAuth {
                 envelope.message.unwrap_or_default()
             )));
         }
-        // data 为 null 表示「池子里此刻没号可发」。对服务端那是正常状态，对这里
-        // 依然是拿不到凭据。
-        envelope
-            .data
-            .ok_or_else(|| std::io::Error::other("no account available in the pool"))
+        Ok(envelope.data)
     }
 
     fn store(&self, data: LeaseData) -> std::io::Result<CodexAuth> {
@@ -381,6 +390,16 @@ impl PoolAuth {
     fn cached_auth(&self) -> Option<CodexAuth> {
         let guard = self.lease.read().ok()?;
         guard.as_ref().map(|lease| lease.auth.clone())
+    }
+
+    /// 服务端不打算再发手上这个号了，忘掉它。
+    ///
+    /// 留着的话下一个请求还会把它当作「我手上的号」报上去，连带把**退回本地之后**
+    /// 跑掉的用量和额度读数记到它头上——那是调度赖以判断的读数，污染不得。
+    fn forget_lease(&self) {
+        if let Ok(mut guard) = self.lease.write() {
+            *guard = None;
+        }
     }
 
     fn held_account(&self) -> Option<String> {

@@ -209,18 +209,47 @@ fn an_unconfigured_home_leaves_upstream_auth_alone() {
 }
 
 fn fake_access_token() -> String {
+    fake_jwt("acct-pool")
+}
+
+/// 一个能被解析出账号 id 的 JWT。签名不作数，上游只读 claims。
+fn fake_jwt(account_id: &str) -> String {
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     let header = b64(br#"{"alg":"none","typ":"JWT"}"#);
     let payload = serde_json::json!({
-        "email": "pool@example.com",
+        "email": format!("{account_id}@example.com"),
         "https://api.openai.com/auth": {
-            "chatgpt_user_id": "user-pool",
-            "chatgpt_account_id": "acct-pool",
+            "chatgpt_user_id": format!("user-{account_id}"),
+            "chatgpt_account_id": account_id,
             "chatgpt_plan_type": "plus",
         },
     });
     let payload = b64(&serde_json::to_vec(&payload).expect("payload"));
     format!("{header}.{payload}.{}", b64(b"sig"))
+}
+
+/// 本机自己 `codex login` 登出来的那份凭据。
+fn write_local_auth(codex_home: &std::path::Path, account_id: &str) {
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": fake_jwt(account_id),
+                "access_token": "local-access-token",
+                "refresh_token": "local-refresh-token",
+                "account_id": account_id,
+            },
+            "last_refresh": chrono::Utc::now(),
+        })
+        .to_string(),
+    )
+    .expect("write auth.json");
+}
+
+/// 服务端的「此刻没号可发」：`code` 是 0，`data` 是 null。
+fn empty_pool_body() -> serde_json::Value {
+    serde_json::json!({"code": 0, "data": null})
 }
 
 fn lease_body(account_key: &str) -> serde_json::Value {
@@ -229,7 +258,6 @@ fn lease_body(account_key: &str) -> serde_json::Value {
         "data": {
             "account_key": account_key,
             "plan": "plus",
-            "lease_ttl_seconds": 600,
             "auth_json": {
                 "tokens": {
                     "access_token": fake_access_token(),
@@ -453,4 +481,113 @@ async fn a_401_is_reported_so_the_pool_can_park_the_account() {
         .map(|request| request.body_json::<serde_json::Value>().expect("json"))
         .and_then(|body| body.get("reject").cloned());
     assert_eq!(reject, Some(serde_json::json!("unauthorized")));
+}
+
+/// 「此刻没号可发」和「联系不上」必须分开处置。
+///
+/// 连不上是抖动，手上那份还能顶一会儿（见上面那个测试）；而服务端明确说没号，说
+/// 的就是它不打算再发手上这个了——多半正是因为它额度到顶/被停用/在冷却。这时候继
+/// 续骑着只会一路撞墙，还撞不出 401（429 不走 `refresh()`），永远逃不出来。
+#[tokio::test]
+async fn an_empty_pool_does_not_keep_riding_the_old_lease() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-a")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_pool_body()))
+        .mount(&server)
+        .await;
+
+    let (pool, _home) = provider(&server);
+    pool.current(true).await.expect("initial lease");
+    next_request(&pool);
+
+    assert!(
+        pool.current(/*allow_stale*/ true).await.is_err(),
+        "「没号可发」是确定的答复，不该被当成抖动而复用旧租约"
+    );
+    assert!(
+        pool.lease.read().expect("lease lock").is_none(),
+        "还记着那个号的话，退回本地之后跑掉的用量和额度读数会被记到它头上"
+    );
+}
+
+/// 池子给不出号的时候退回本机 `auth.json`，而不是让整台机器变成「未登录」。
+///
+/// 装上 provider 之后上游的 `load_auth()` 原本只问池子，问不出来就返回 None。号池
+/// 空了是个正常状态（几个号同时到顶），那时候本机自己登录过的号还在，没有道理不用。
+///
+/// 退回是**每次调用**的降级，不是切换：provider 还装着，下一次取凭据照样先问池子。
+#[tokio::test]
+async fn an_empty_pool_falls_back_to_the_local_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-a")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_pool_body()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-b")))
+        .mount(&server)
+        .await;
+
+    let (pool, home) = provider(&server);
+    write_local_auth(home.path(), "acct-local");
+    let pool = std::sync::Arc::new(pool);
+
+    let manager = crate::auth::AuthManager::shared(
+        home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        crate::AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        crate::auth::AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    manager
+        .set_external_auth(pool.clone())
+        .await
+        .expect("the pool serves the first lease");
+
+    let leased = manager.auth().await.expect("the pool has an account");
+    assert_eq!(
+        leased.get_account_id().as_deref(),
+        Some("acct-pool"),
+        "有号的时候必须用池子的号，本地那份只是兜底"
+    );
+
+    next_request(&pool);
+    let fallback = manager.auth().await.expect("号池空了不该让本机变成未登录");
+    assert_eq!(
+        fallback.get_account_id().as_deref(),
+        Some("acct-local"),
+        "池子给不出号时应当退回本机 auth.json"
+    );
+    assert!(
+        manager.has_external_auth(),
+        "退回是这一次调用的降级，provider 必须还装着，下一次还要先问池子"
+    );
+
+    // 池子一有号就必须回到池子上——本机那个号是兜底，不是新的默认。
+    next_request(&pool);
+    let recovered = manager.auth().await.expect("the pool has an account again");
+    assert_eq!(
+        recovered.get_account_id().as_deref(),
+        Some("acct-pool"),
+        "号一回来就该切回池子，退回本地不能变成一条单向路"
+    );
 }

@@ -2200,13 +2200,24 @@ impl AuthManager {
 
     async fn load_auth(&self) -> Option<CodexAuth> {
         if let Some(external_auth) = self.external_auth() {
-            return match self.resolve_external_auth(&external_auth).await {
-                Ok(auth) => Some(auth),
+            match self.resolve_external_auth(&external_auth).await {
+                Ok(auth) => return Some(auth),
+                // codext: 池子给不出号（号池空了，或者连不上而手上又没有可用租约）时，
+                // 不该让整台机器变成「未登录」——退回本机 auth.json。这只是这一次取
+                // 凭据的降级，provider 还在，下一次照样先问池子。
                 Err(err) => {
-                    tracing::error!("Failed to resolve external auth: {err}");
-                    None
+                    tracing::warn!("codext: falling back to the local auth: {err}");
+                    // 池子发的凭据被 `commit_external_auth` 镜像进了进程内的 Ephemeral
+                    // 存储，而下面那条本地加载**先读它**——不清掉的话「退回本地」会原样
+                    // 拿回刚刚用不了的那份，等于没退。
+                    let _ = create_auth_storage(
+                        self.codex_home.clone(),
+                        AuthCredentialsStoreMode::Ephemeral,
+                        AuthKeyringBackendKind::default(),
+                    )
+                    .delete();
                 }
-            };
+            }
         }
 
         let forced_chatgpt_workspace_id = self.forced_chatgpt_workspace_id();
@@ -2432,7 +2443,12 @@ impl AuthManager {
         }
 
         let attempted_auth = auth.clone();
-        let result = if self.has_external_auth() {
+        // codext: 手上这份是本机 `auth.json` 登出来的话，续期只能走下面的本地路径。
+        // 那正是池子给不出号时退回的那份（见 `load_auth`），它自带 refresh token；按
+        // 「装没装 provider」判的话，它会被送去问池子——而池子正是刚才给不出号的那个。
+        // provider 自己发的凭据（池子的 ChatgptAuthTokens、bearer 的 Headers）不受影响。
+        let result = if self.has_external_auth() && !matches!(attempted_auth, CodexAuth::Chatgpt(_))
+        {
             self.refresh_external_auth(ExternalAuthRefreshReason::Unauthorized)
                 .await
         } else {
