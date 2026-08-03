@@ -41,7 +41,14 @@ jobs:
 
       # rust-toolchain.toml pins the channel; installing the target separately
       # is still needed because rustup only fetches the host one by default.
+      #
+      # `working-directory` is the whole point: that file lives in codex-rs, so
+      # from the repository root rustup resolves the runner's default toolchain
+      # and adds the target to that one, while the build a few steps down runs
+      # under the pinned 1.95.0 — which then has no std for the target and dies
+      # on `can't find crate for 'core'`.
       - name: Install the Rust target
+        working-directory: codex-rs
         run: rustup target add ${{ matrix.target }}
 
       # musl needs its own linker and OpenSSL is built from source against it.
