@@ -32,8 +32,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # gnu, not musl, and not by preference: the dependency tree reaches
+          # `v8`, whose build script downloads a prebuilt static library, and
+          # rusty_v8 publishes none for musl — the download 404s. Building V8
+          # from source needs depot_tools and hours. `ags update` asks for musl
+          # first and falls back to gnu, so it finds this.
           - runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
           - runner: macos-14
             target: aarch64-apple-darwin
     steps:
@@ -51,12 +56,11 @@ jobs:
         working-directory: codex-rs
         run: rustup target add ${{ matrix.target }}
 
-      # musl needs its own linker and OpenSSL is built from source against it.
-      - if: endsWith(matrix.target, '-linux-musl')
-        name: Install musl build tools
+      - if: endsWith(matrix.target, '-linux-gnu')
+        name: Install the Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config
+          sudo apt-get install -y pkg-config libssl-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
