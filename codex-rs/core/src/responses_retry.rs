@@ -197,6 +197,9 @@ impl RetryKind {
         }
         if is_account_scoped(err) {
             return if leases_credentials(turn_context) {
+                // codext: 对面刚明确拒了手上这个号。报上去，否则服务端要等后台观测
+                // （最快 30 秒）才知道，这期间会把同一个跑满的号一次次发回来。
+                codex_login::report_account_refused();
                 Self::SwapAccount
             } else {
                 Self::QuotaWindow {

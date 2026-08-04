@@ -40,403 +40,152 @@ fn the_device_id_is_stable_across_runs_in_the_same_workspace() {
     );
 }
 
-fn write_rollout(dir: &std::path::Path, events: &[serde_json::Value]) -> std::path::PathBuf {
-    let path = dir.join("rollout-2026-08-03T00-00-00-11111111-2222-3333-4444-555555555555.jsonl");
-    let body: Vec<String> = events.iter().map(|e| e.to_string()).collect();
-    std::fs::write(&path, body.join("\n")).expect("write rollout");
-    path
+/// 账本是进程级静态，这些测试必须串行，否则一个测试的账会被另一个看见。
+static LEDGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn reset_ledger(path: Option<std::path::PathBuf>) {
+    let mut ledger = super::LEDGER.lock().expect("ledger lock");
+    ledger.path = path;
+    ledger.held = None;
+    ledger.refused = false;
+    ledger.rows.clear();
 }
 
-fn token_count_event(total: u64, used_percent: f64) -> serde_json::Value {
-    serde_json::json!({
-        "timestamp": "2026-08-03T00:00:00.000Z",
-        "payload": {
-            "type": "token_count",
-            "model": "gpt-5.6",
-            "info": {"total_token_usage": {
-                "input_tokens": total, "cached_input_tokens": 0,
-                "output_tokens": 0, "reasoning_output_tokens": 0,
-                "total_tokens": total,
-            }},
-            "rate_limits": {
-                "plan_type": "plus",
-                "primary": {"window_minutes": 300, "used_percent": used_percent, "resets_at": 1786000000},
-                "secondary": {"window_minutes": 10080, "used_percent": 4.0, "resets_at": 1786600000},
-            },
-        },
-    })
+/// 一次调用的用量。分不分到 input/output 不影响这些断言，看的是 total 和归属。
+fn turn(total: i64) -> codex_protocol::protocol::TokenUsage {
+    codex_protocol::protocol::TokenUsage {
+        input_tokens: total,
+        cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: 0,
+        total_tokens: total,
+    }
 }
 
-fn incremental_token_count_event(total: u64, last: u64) -> serde_json::Value {
-    serde_json::json!({
-        "timestamp": "2026-08-03T00:00:00.000Z",
-        "type": "event_msg",
-        "payload": {
-            "type": "token_count",
-            "info": {
-                "total_token_usage": {
-                    "input_tokens": total, "cached_input_tokens": 0,
-                    "output_tokens": 0, "reasoning_output_tokens": 0,
-                    "total_tokens": total,
-                },
-                "last_token_usage": {
-                    "input_tokens": last, "cached_input_tokens": 0,
-                    "output_tokens": 0, "reasoning_output_tokens": 0,
-                    "total_tokens": last,
-                },
-            },
-        },
-    })
+fn row_for<'a>(
+    reported: &'a [super::SessionUsage],
+    account_key: &str,
+    model: &str,
+) -> &'a super::SessionUsage {
+    reported
+        .iter()
+        .find(|row| {
+            row.account_key.as_deref() == Some(account_key)
+                && row.model.as_deref() == Some(model)
+        })
+        .unwrap_or_else(|| panic!("{account_key}/{model} 应该有一条账：{reported:?}"))
 }
 
-/// 累计量取**最后一条**事件，不是把每条加起来。
+/// 用量必须记在**当时服务它的那个号**头上。
 ///
-/// `total_token_usage` 本身就是会话累计值，相加等于把消耗乘以回合数——一个长会话
-/// 能报出几亿个它根本没用过的 token，然后污染整个池子的统计。请求数是唯一该累加的。
+/// 这是整套统计的核心断言。旧做法是事后扫 rollout 反推归属，一个本地没有记录的
+/// 会话会从 0 起算，把它的整段历史一次性算给换号后手上的那个号——线上因此出现过
+/// 「跑满 100% 却零请求」和「记了两千多次请求却一点额度都没动」这两头对称的错。
 #[test]
-fn session_totals_come_from_the_last_event_not_the_sum() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = write_rollout(
-        dir.path(),
-        &[
-            token_count_event(1_000, 5.0),
-            token_count_event(2_500, 12.5),
-        ],
-    );
+fn usage_follows_the_account_that_served_the_turn() {
+    let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    reset_ledger(None);
 
-    let usage = super::read_rollout(&path).expect("rollout should parse");
-    assert_eq!(usage.requests, 2, "请求数要累加");
-    assert_eq!(usage.total_tokens, 2_500, "token 取最后一条，不是 3500");
-    assert_eq!(usage.session_id, "11111111-2222-3333-4444-555555555555");
-    let limits = usage.rate_limits.expect("应当带回额度读数");
-    assert_eq!(limits.windows.len(), 2, "5h 和周窗都要带上");
-    // 留最新那条读数：最后一次调用才反映账号此刻的额度。
-    assert_eq!(limits.windows[0].used_percent, 12.5);
-    assert_eq!(limits.windows[0].window_minutes, 300);
-    assert_eq!(limits.windows[1].window_minutes, 10080);
-}
+    super::set_held_account(Some("acct-a".to_string()));
+    super::record_turn_usage("s-1", "gpt-5", &turn(100));
+    super::record_turn_usage("s-1", "gpt-5", &turn(50));
+    super::set_held_account(Some("acct-b".to_string()));
+    super::record_turn_usage("s-1", "gpt-5", &turn(7));
 
-/// 子线程第一条累计量带着父线程历史；重复快照也不是第二次请求。
-#[test]
-fn incremental_usage_excludes_inherited_baseline_and_duplicate_snapshots() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let first = incremental_token_count_event(1_000_100, 100);
-    let path = write_rollout(
-        dir.path(),
-        &[
-            serde_json::json!({
-                "timestamp": "2026-08-03T00:00:00.000Z",
-                "type": "turn_context",
-                "payload": {"model": "gpt-5.6-sol"},
-            }),
-            first.clone(),
-            first,
-            incremental_token_count_event(1_000_350, 250),
-        ],
-    );
-
-    let usage = super::read_rollout(&path).expect("rollout should parse");
-    assert_eq!(usage.counter_version, 2);
-    assert_eq!(usage.requests, 2, "重复快照不能多算一次请求");
-    assert_eq!(usage.total_tokens, 350, "父线程的百万 token 基线不能算进来");
-    assert_eq!(usage.input_tokens, 350);
-    assert_eq!(usage.model.as_deref(), Some("gpt-5.6-sol"));
-}
-
-#[test]
-fn null_info_does_not_disable_incremental_accounting() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = write_rollout(
-        dir.path(),
-        &[
-            incremental_token_count_event(1_000_100, 100),
-            serde_json::json!({
-                "timestamp": "2026-08-03T00:00:01.000Z",
-                "type": "event_msg",
-                "payload": {
-                    "type": "token_count",
-                    "info": null,
-                    "rate_limits": {
-                        "plan_type": "plus",
-                        "primary": {
-                            "window_minutes": 300,
-                            "used_percent": 33.0,
-                            "resets_at": 1786000000
-                        },
-                        "secondary": null
-                    }
-                }
-            }),
-            incremental_token_count_event(1_000_350, 250),
-        ],
-    );
-
-    let usage = super::read_rollout(&path).expect("rollout should parse");
-    assert_eq!(usage.requests, 2);
-    assert_eq!(usage.total_tokens, 350);
+    let reported = super::pending_usage();
+    let first = row_for(&reported, "acct-a", "gpt-5");
+    assert_eq!((first.requests, first.total_tokens), (2, 150));
+    let second = row_for(&reported, "acct-b", "gpt-5");
     assert_eq!(
-        usage.rate_limits.expect("rate limit snapshot").windows[0].used_percent,
-        33.0
+        (second.requests, second.total_tokens),
+        (1, 7),
+        "换号之后的用量不能倒灌回上一个号"
     );
 }
 
-/// 两次刷新之间 OpenAI 会发全 null 的窗口。那不是"用量为零"，不能当读数报上去
-/// ——报了会把一个快跑满的号在调度眼里刷成满血。
+/// 同一个号跑了两个模型，两段要分开——计价按模型走，混在一起就没法算钱了。
 #[test]
-fn all_null_windows_do_not_become_a_zero_usage_reading() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = write_rollout(
-        dir.path(),
-        &[serde_json::json!({
-            "timestamp": "2026-08-03T00:00:00.000Z",
-            "payload": {
-                "type": "token_count",
-                "info": {"total_token_usage": {"total_tokens": 10}},
-                "rate_limits": {"limit_id": "codex", "primary": null, "secondary": null},
-            },
-        })],
-    );
+fn each_model_keeps_its_own_line() {
+    let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    reset_ledger(None);
 
-    let usage = super::read_rollout(&path).expect("rollout should parse");
-    assert_eq!(usage.requests, 1);
-    assert!(
-        usage.rate_limits.is_none(),
-        "全 null 的窗口不能变成一条读数"
-    );
+    super::set_held_account(Some("acct-a".to_string()));
+    super::record_turn_usage("s-1", "gpt-5", &turn(10));
+    super::record_turn_usage("s-1", "gpt-5-codex", &turn(300));
+
+    let reported = super::pending_usage();
+    assert_eq!(row_for(&reported, "acct-a", "gpt-5").total_tokens, 10);
+    assert_eq!(row_for(&reported, "acct-a", "gpt-5-codex").total_tokens, 300);
 }
 
-/// 已经归属过的会话不能改记到现在这个号头上。
+/// 没租到号的时候跑的用量不归池子。
 ///
-/// 上报要跨运行才补得全：一次 `codex exec` 的最后一轮响应写完 rollout 就退出了，
-/// 没有后续调用能把它带上去，只能等下一次运行补报——而那时手上很可能是另一个号。
-/// 用量的唯一键是 (session_id, account_key)，记错号不是覆盖而是**多出一整行**，
-/// 两个号各背一份完整用量。
+/// 少了这一条，退回本机 auth.json 期间的用量会被栽到最后持有过的那个号头上。
 #[test]
-fn a_session_keeps_the_account_that_actually_served_it() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let day = home.path().join("sessions/2026/08/03");
-    std::fs::create_dir_all(&day).expect("session dir");
-    write_rollout(&day, &[token_count_event(1_000, 5.0)]);
+fn usage_without_a_lease_is_charged_to_nobody() {
+    let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    reset_ledger(None);
 
-    let long_ago = std::time::SystemTime::UNIX_EPOCH;
-    let first = super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
+    super::set_held_account(None);
+    super::record_turn_usage("s-1", "gpt-5", &turn(999));
+
+    assert!(super::pending_usage().is_empty());
+}
+
+/// 拒绝要一直留到真的送达为止，送达之后只报一次。
+///
+/// 如果在发请求**之前**就销账，一次网络失败就永久丢掉这条消息：服务端再也不知道
+/// 这个号满了，于是一次次把它发回给正在重试的会话——正是要修的那个死循环。
+#[test]
+fn a_refusal_survives_until_it_is_delivered() {
+    let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    reset_ledger(None);
+
+    assert!(!super::refusal_pending());
+    super::report_account_refused();
+    // 读它不销账：请求可能失败，那时候还得再报一次。
+    assert!(super::refusal_pending());
+    assert!(super::refusal_pending());
+    super::clear_refusal();
+    assert!(!super::refusal_pending(), "送达之后不能再报第二遍");
+}
+
+/// 账本要能跨进程重启接上。
+///
+/// 服务端按 (会话, 号, 模型) 取较大值来保证重发幂等；一个重启后从 0 重新累计的
+/// 进程会一直报出比库里更小的数，那之后的新用量就再也盖不过去了。
+#[test]
+fn the_ledger_survives_a_restart() {
+    let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    let home = tempfile::tempdir().expect("tempdir");
+    reset_ledger(Some(home.path().join(super::LEDGER_FILE)));
+
+    super::set_held_account(Some("acct-a".to_string()));
+    super::record_turn_usage("s-1", "gpt-5", &turn(120));
+
+    // 换个进程：内存清空，只从文件恢复。
+    reset_ledger(None);
+    assert!(super::pending_usage().is_empty());
+    super::attach_ledger(home.path());
+
+    let reported = super::pending_usage();
+    assert_eq!(row_for(&reported, "acct-a", "gpt-5").total_tokens, 120);
+}
+
+/// 报完不删：重发是空操作，而「发出去了但回包丢了」在客户端看来和没发一样。
+#[test]
+fn reporting_does_not_clear_the_ledger() {
+    let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    reset_ledger(None);
+
+    super::set_held_account(Some("acct-a".to_string()));
+    super::record_turn_usage("s-1", "gpt-5", &turn(5));
+
+    let first = super::pending_usage();
+    let again = super::pending_usage();
+    assert_eq!(first, again);
     assert_eq!(first.len(), 1);
-    assert_eq!(first[0].account_key.as_deref(), Some("acct-a"));
-
-    // 下一次运行手上是另一个号，但这个会话是 acct-a 跑的。
-    let again = super::collect_sessions(
-        home.path(),
-        Some("acct-b"),
-        std::time::SystemTime::now(),
-        None,
-    );
-    assert_eq!(again[0].account_key.as_deref(), Some("acct-a"));
-}
-
-#[test]
-fn legacy_string_attribution_migrates_without_reassigning_old_usage() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let day = home.path().join("sessions/2026/08/03");
-    std::fs::create_dir_all(&day).expect("session dir");
-    let path = write_rollout(&day, &[incremental_token_count_event(350, 350)]);
-    let session_id = super::rollout_session_id(&path);
-    let legacy = std::collections::HashMap::from([(session_id, "acct-a")]);
-    std::fs::write(
-        super::attribution_path(home.path()),
-        serde_json::to_string(&legacy).expect("serialize legacy attribution"),
-    )
-    .expect("write legacy attribution");
-
-    // 新版本第一次看到旧的字符串归属时，历史 350 全留在 A；当前持有的 B 只
-    // 接收迁移之后产生的 delta。
-    let long_ago = std::time::SystemTime::UNIX_EPOCH;
-    let migrated = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
-    let a = migrated
-        .iter()
-        .find(|usage| usage.account_key.as_deref() == Some("acct-a"))
-        .expect("legacy acct-a segment");
-    assert_eq!((a.requests, a.total_tokens), (1, 350));
-
-    write_rollout(
-        &day,
-        &[
-            incremental_token_count_event(350, 350),
-            incremental_token_count_event(400, 50),
-        ],
-    );
-    let after = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
-    let by_account: std::collections::HashMap<_, _> = after
-        .iter()
-        .map(|usage| {
-            (
-                usage.account_key.as_deref().expect("account"),
-                (usage.requests, usage.total_tokens),
-            )
-        })
-        .collect();
-    assert_eq!(by_account["acct-a"], (1, 350));
-    assert_eq!(by_account["acct-b"], (1, 50));
-}
-
-#[test]
-fn one_rollout_is_split_across_account_transitions() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let day = home.path().join("sessions/2026/08/03");
-    std::fs::create_dir_all(&day).expect("session dir");
-    let long_ago = std::time::SystemTime::UNIX_EPOCH;
-
-    write_rollout(&day, &[]);
-    super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
-    write_rollout(&day, &[incremental_token_count_event(100, 100)]);
-    super::collect_sessions(home.path(), Some("acct-a"), long_ago, Some(Some("acct-b")));
-
-    write_rollout(
-        &day,
-        &[
-            incremental_token_count_event(100, 100),
-            incremental_token_count_event(350, 250),
-        ],
-    );
-    let segments = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
-    let by_account: std::collections::HashMap<_, _> = segments
-        .iter()
-        .map(|usage| {
-            (
-                usage.account_key.as_deref().expect("account"),
-                (usage.requests, usage.total_tokens),
-            )
-        })
-        .collect();
-    assert_eq!(by_account["acct-a"], (1, 100));
-    assert_eq!(by_account["acct-b"], (1, 250));
-
-    write_rollout(
-        &day,
-        &[
-            incremental_token_count_event(100, 100),
-            incremental_token_count_event(350, 250),
-            incremental_token_count_event(400, 50),
-        ],
-    );
-    let segments = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
-    let b = segments
-        .iter()
-        .find(|usage| usage.account_key.as_deref() == Some("acct-b"))
-        .expect("acct-b segment");
-    assert_eq!((b.requests, b.total_tokens), (2, 300));
-}
-
-#[test]
-fn local_auth_gap_is_not_charged_to_pool_accounts() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let day = home.path().join("sessions/2026/08/03");
-    std::fs::create_dir_all(&day).expect("session dir");
-    let long_ago = std::time::SystemTime::UNIX_EPOCH;
-
-    write_rollout(&day, &[incremental_token_count_event(100, 100)]);
-    super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
-    super::collect_sessions(home.path(), Some("acct-a"), long_ago, Some(None));
-
-    write_rollout(
-        &day,
-        &[
-            incremental_token_count_event(100, 100),
-            incremental_token_count_event(150, 50),
-        ],
-    );
-    super::collect_sessions(home.path(), None, long_ago, None);
-    super::collect_sessions(home.path(), None, long_ago, Some(Some("acct-b")));
-
-    write_rollout(
-        &day,
-        &[
-            incremental_token_count_event(100, 100),
-            incremental_token_count_event(150, 50),
-            incremental_token_count_event(175, 25),
-        ],
-    );
-    let segments = super::collect_sessions(home.path(), Some("acct-b"), long_ago, None);
-    let by_account: std::collections::HashMap<_, _> = segments
-        .iter()
-        .map(|usage| {
-            (
-                usage.account_key.as_deref().expect("account"),
-                usage.total_tokens,
-            )
-        })
-        .collect();
-    assert_eq!(by_account["acct-a"], 100);
-    assert_eq!(by_account["acct-b"], 25);
-}
-
-/// 归属要在**还没有用量**的时候就落下。
-///
-/// 一次运行里最早那次扫描发生在第一个响应之前，那时 rollout 只有会话头、没有
-/// `token_count`。那时不落归属的话这个会话就永远没有主人，下一次运行也不敢认领
-/// ——于是每一轮的最后一次响应都会丢，而只跑一轮的 `codex exec` 等于什么都报不
-/// 出来。真机上就是这么坏的：两次运行跑通了请求，库里一行用量都没有。
-#[test]
-fn a_session_is_claimed_before_it_has_any_usage() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let day = home.path().join("sessions/2026/08/03");
-    std::fs::create_dir_all(&day).expect("session dir");
-    // 只有会话头，没有 token_count —— 第一个响应还没回来的样子。
-    write_rollout(
-        &day,
-        &[serde_json::json!({"timestamp": "2026-08-03T00:00:00.000Z",
-                             "type": "session_meta", "payload": {}})],
-    );
-    let long_ago = std::time::SystemTime::UNIX_EPOCH;
-    assert!(
-        super::collect_sessions(home.path(), Some("acct-a"), long_ago, None).is_empty(),
-        "还没有用量，这一轮不该报任何东西"
-    );
-
-    // 响应回来了，rollout 补上 token_count。此刻「本次运行」已经是新的一次了。
-    write_rollout(&day, &[token_count_event(1_000, 5.0)]);
-    let later = super::collect_sessions(home.path(), None, std::time::SystemTime::now(), None);
-    assert_eq!(later.len(), 1, "上一次运行的尾巴必须补得上来");
-    assert_eq!(later[0].account_key.as_deref(), Some("acct-a"));
-}
-
-/// 本次运行没碰过、又没有归属记录的会话，一条都不能认领。
-///
-/// 同一个 `CODEX_HOME` 里躺着装池子之前的历史、以及用户自己 `codex login` 跑的
-/// 会话。认领它们等于把一整份用量凭空记到当前这个号头上——真机第一次跑就撞上了，
-/// 一个池子建立之前的会话被记了 24601 个 token。
-#[test]
-fn a_session_from_before_the_pool_is_not_claimed() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let day = home.path().join("sessions/2026/08/03");
-    std::fs::create_dir_all(&day).expect("session dir");
-    write_rollout(&day, &[token_count_event(24_601, 5.0)]);
-
-    // 「本次运行」从现在开始，而那个 rollout 是之前写的。
-    let claimed = super::collect_sessions(
-        home.path(),
-        Some("acct-a"),
-        std::time::SystemTime::now(),
-        None,
-    );
-    assert!(claimed.is_empty(), "不认识的历史会话不能算到当前账号头上");
-}
-
-/// 归属表不能无限长下去：扫不到的会话再也不会被上报，留着没有意义。
-#[test]
-fn the_attribution_file_only_keeps_what_is_still_reportable() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let day = home.path().join("sessions/2026/08/03");
-    std::fs::create_dir_all(&day).expect("session dir");
-    write_rollout(&day, &[token_count_event(1_000, 5.0)]);
-    let long_ago = std::time::SystemTime::UNIX_EPOCH;
-    super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
-
-    // 会话文件没了，归属记录也该跟着走。
-    std::fs::remove_dir_all(&day).expect("drop the rollout");
-    super::collect_sessions(home.path(), Some("acct-a"), long_ago, None);
-    let stored =
-        std::fs::read_to_string(home.path().join("pool-sessions.json")).expect("attribution file");
-    assert_eq!(stored, "{}");
 }
 
 /// 没配就必须返回 None —— 那是「退回上游本地 auth.json」的信号，不是错误。
@@ -518,14 +267,11 @@ fn next_request(pool: &PoolAuth) {
 
 fn provider(server: &MockServer) -> (PoolAuth, tempfile::TempDir) {
     let home = tempfile::tempdir().expect("tempdir");
-    let pool = PoolAuth::new(
-        Config {
-            base_url: server.uri(),
-            key: "test-key".to_string(),
-            device_id: "test-device".to_string(),
-        },
-        home.path().to_path_buf(),
-    );
+    let pool = PoolAuth::new(Config {
+        base_url: server.uri(),
+        key: "test-key".to_string(),
+        device_id: "test-device".to_string(),
+    });
     (pool, home)
 }
 

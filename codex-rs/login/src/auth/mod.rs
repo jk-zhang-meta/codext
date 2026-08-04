@@ -20,6 +20,10 @@ pub use bedrock_api_key::login_with_bedrock_api_key;
 // 用户，而不是悄悄退回本地号或者把会话打断。
 pub use pool::pool_is_exhausted;
 pub use pool::take_pool_exhaustion_notice;
+// codext: 用量在一次模型调用结束那一刻记账，被拒也在发生那一刻上报——只有 core
+// 到得了那两个位置，而只有这里知道当时手上是哪个号。
+pub use pool::record_turn_usage;
+pub use pool::report_account_refused;
 
 pub use error::RefreshTokenFailedError;
 pub use error::RefreshTokenFailedReason;

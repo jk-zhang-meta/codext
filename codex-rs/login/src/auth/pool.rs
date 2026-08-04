@@ -6,20 +6,22 @@
 //!
 //! **每个请求都向池子问一次该用哪个号，本地不做缓存判断。** 稳定性由服务端的调度
 //! 算法保证（手上那个还能用就原样还回来，绝不为"别的号更宽裕"而换），不是靠客户端
-//! 攥着不放——那样额度跑满了也换不掉。同一趟往返顺带把用量和额度读数带上去，服务端
-//! 因此总是拿着上一次响应的真实读数在做决定。
+//! 攥着不放——那样额度跑满了也换不掉。同一趟往返顺带把**用量**带上去。
+//!
+//! 用量在**一次模型调用结束那一刻**记账（[`record_turn_usage`]），因为只有那一刻
+//! 同时知道三件事：这次花了多少 token、用的哪个号、哪个模型。曾经的做法是事后回头
+//! 扫 rollout 文件反推归属，那是错的——rollout 不记录每条 `token_count` 是哪个号
+//! 跑出来的，只能靠"上次扫到哪儿"做差，而一个没有本地记录的会话会从 0 起算，把它
+//! 的**整段历史**一次性记到此刻手上那个号头上。
+//!
+//! 额度读数同样不由终端上报，理由相同。服务端拿账号自己的 token 直接问 OpenAI。
 //!
 //! refresh token 永远留在服务端：`CodexAuth::from_external_chatgpt_tokens` 造出
 //! 来的凭据本来就不带它，续期由服务端独占。多台机器各自拿着同一个 refresh token
 //! 去刷新，只会把彼此的令牌轮换作废。
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::fs::OpenOptions;
-use std::io::BufRead;
-use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,54 +58,42 @@ const POOL_TIMEOUT: Duration = Duration::from_secs(3);
 /// 走一遍 `reload()`，而围绕一次模型调用它会被调几十次（实测启动阶段 550 毫秒里
 /// 十几次）。不合并的话一个请求要打几十个往返，服务端被当成心跳靶子。
 ///
-/// 窗口取 1 秒是有依据的，不是随手定的：决策**只可能**在有新信息时改变，而新信息
-/// 最快也要 [`USAGE_SCAN_MIN_INTERVAL`]（5 秒）才来一批。真正的模型调用间隔以秒
-/// 计，所以每个请求依然拿到一次全新的决策——被合并掉的全是同一个请求内部的重复
-/// 提问。原来那套是 200 秒，差着两个数量级。
+/// 窗口取 1 秒是有依据的，不是随手定的：真正的模型调用间隔以秒计，所以每个请求
+/// 依然拿到一次全新的决策——被合并掉的全是同一个请求内部的重复提问。原来那套是
+/// 200 秒，差着两个数量级。
 ///
 /// 401 不走这条路：`refresh()` 永远重新问，手上那份刚被对面拒绝。
 const DECISION_COALESCE: Duration = Duration::from_secs(1);
 
-/// 两次扫 rollout 之间至少隔这么久。
-///
-/// 派号是每个请求一次，扫文件没必要跟着这么密——同一个响应写进 rollout 之后，
-/// 隔几秒扫到和立刻扫到没有区别，而每个请求都重读一遍几 MB 的会话文件有。
-const USAGE_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(5);
-
 /// 没有请求的时候多久主动找一次池子。
 ///
-/// 派号本身挂在请求路径上，安静的时候不需要它。这个心跳是为了让一个开着不动的
-/// 会话也能把读数报上去，顺带把租约续上。
+/// 派号本身挂在请求路径上，安静的时候不需要它。这个心跳是为了让一个跑完最后一轮
+/// 就没有下一个请求的会话也能把用量报上去，顺带把租约续上。
 const IDLE_TICK: Duration = Duration::from_secs(20);
 
-/// 往回扫多久之内动过的 rollout。
+/// 一条账目多久没动过就不再上报。
 ///
-/// **不能只扫"本次运行开始之后"的。** 一次 `codex exec` 的最后一次响应写完
-/// rollout 就退出了，没有下一个取凭据的调用会把它带上去——只报本次运行的话，
-/// 每次运行都会丢掉最后一轮，而一个只跑一轮的 `codex exec` 就等于**永远报不出
-/// 任何读数**。读数报不出来，服务端对每个号都只能假设满余量，调度直接退化。
+/// 上报的是**累计值**、服务端取较大值，所以重复报无害、少报一轮也能补上——只要
+/// 这条账还在。留一段时间是为了让一次 `codex exec` 的最后一轮有机会被下一次运行
+/// 带上去：那一轮跑完进程就退出了，本次运行里没有下一个请求能捎带它。
+const LEDGER_KEEP_SECONDS: u64 = 6 * 3600;
+
+/// 账本最多留多少条，防止一个用了很久的 `CODEX_HOME` 让文件无限长下去。
+const MAX_LEDGER_ROWS: usize = 500;
+
+/// v3 表示这份计数是在**每次调用结束那一刻**按 (会话, 号, 模型) 记下的实际用量。
 ///
-/// 所以扫最近这段时间，让下一次运行把上一次的尾巴带上去。归属靠
-/// [`ATTRIBUTION_FILE`] 记着，不会算到错误的号头上。
-const REPORT_WINDOW_SECONDS: u64 = 6 * 3600;
+/// 必须和 v2 分开：v2 也是这个字段名、这个形状，但那份数字是事后扫 rollout 反推
+/// 出来的，归属天生就可能是错的。服务端只收 v3，等于把还没升级的旧二进制报上来的
+/// 脏数据挡在外面——宁可暂时没有用量，也不要错的用量。
+const USAGE_COUNTER_VERSION: u8 = 3;
 
-/// 一次最多扫多少个 rollout。够覆盖最近几次运行摸过的会话，又不至于在一个跑了很久
-/// 的 `CODEX_HOME` 上翻几千个文件。
-const MAX_ROLLOUTS: usize = 20;
-
-/// 会话到账号的归属记录。
+/// 本地账本。存**已经发生**的用量，不存任何需要事后推断的东西。
 ///
-/// 用量的唯一键是 (session_id, account_key)，所以把一个会话记到错误的号头上不是
-/// 覆盖而是**多出一行**，两个号各背一份完整用量。跨运行上报必须知道当初是谁服务
-/// 的，这个文件就是干这个的。
-const ATTRIBUTION_FILE: &str = "pool-sessions.json";
-const ATTRIBUTION_LOCK_FILE: &str = "pool-sessions.lock";
-
-/// 归属表最多留多少条。够覆盖最近几天，又不至于无限长下去。
-const MAX_ATTRIBUTIONS: usize = 500;
-
-/// v2 表示终端上报的是每个账号实际服务段的增量快照。
-const USAGE_COUNTER_VERSION: u8 = 2;
+/// 落盘是为了跨进程重启：服务端按 (会话, 号, 模型) 取较大值来保证重发幂等，
+/// 而一个重启后从 0 重新累计的进程会一直报出比库里更小的数，那些新用量就再也
+/// 盖不过去了。文件里没有凭据，只有计数。
+const LEDGER_FILE: &str = "pool-usage.json";
 
 /// 我们自己那份配置在 `CODEX_HOME` 下的文件名。
 ///
@@ -153,6 +143,202 @@ fn mark_pool_serving() {
     }
 }
 
+/// 本地账本：已发生的用量、手上的号、以及一个"刚被拒"的待报标记。
+///
+/// 是进程级静态而不是挂在 [`PoolAuth`] 上，因为记账点在 core 里（一次模型调用刚
+/// 结束的地方），那里拿不到 `PoolAuth` 实例。和 [`POOL_EXHAUSTED`] 同一个模式。
+static LEDGER: std::sync::Mutex<Ledger> = std::sync::Mutex::new(Ledger::new());
+
+#[derive(Default, Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+struct UsageCounters {
+    requests: u64,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+    total_tokens: u64,
+}
+
+impl UsageCounters {
+    /// 把刚结束的这一次调用加进来。计数只增不减，所以服务端可以安全地取较大值。
+    fn add_turn(&mut self, usage: &codex_protocol::protocol::TokenUsage) {
+        let add = |slot: &mut u64, value: i64| {
+            *slot = slot.saturating_add(u64::try_from(value).unwrap_or(0));
+        };
+        self.requests = self.requests.saturating_add(1);
+        add(&mut self.input_tokens, usage.input_tokens);
+        add(&mut self.cached_input_tokens, usage.cached_input_tokens);
+        add(&mut self.output_tokens, usage.output_tokens);
+        add(&mut self.reasoning_tokens, usage.reasoning_output_tokens);
+        add(&mut self.total_tokens, usage.total_tokens);
+    }
+}
+
+/// 一条账：某个会话在某个号上用某个模型跑出来的累计量。
+#[derive(Serialize, Deserialize, Debug)]
+struct LedgerRow {
+    session_id: String,
+    account_key: String,
+    #[serde(default)]
+    model: String,
+    #[serde(flatten)]
+    counters: UsageCounters,
+    /// 最后一次记账的 unix 秒，只用来裁剪，不上报。
+    updated_at: u64,
+}
+
+struct Ledger {
+    path: Option<PathBuf>,
+    /// 此刻手上的号。`None` 表示没租到（退回本机 auth.json），那期间的用量不归池子。
+    held: Option<String>,
+    /// 手上这个号刚被 OpenAI 以「配额用尽」拒了，等下一次派号时报上去。
+    refused: bool,
+    rows: Vec<LedgerRow>,
+}
+
+impl Ledger {
+    const fn new() -> Self {
+        Self {
+            path: None,
+            held: None,
+            refused: false,
+            rows: Vec::new(),
+        }
+    }
+
+    fn find(&mut self, session_id: &str, account_key: &str, model: &str) -> &mut LedgerRow {
+        if let Some(index) = self.rows.iter().position(|row| {
+            row.session_id == session_id && row.account_key == account_key && row.model == model
+        }) {
+            return &mut self.rows[index];
+        }
+        self.rows.push(LedgerRow {
+            session_id: session_id.to_string(),
+            account_key: account_key.to_string(),
+            model: model.to_string(),
+            counters: UsageCounters::default(),
+            updated_at: 0,
+        });
+        self.rows.last_mut().expect("just pushed")
+    }
+
+    /// 丢掉太旧的账，再按条数兜底。旧账早就报上去了，留着只是让文件变长。
+    fn prune(&mut self, now: u64) {
+        self.rows
+            .retain(|row| now.saturating_sub(row.updated_at) <= LEDGER_KEEP_SECONDS);
+        if self.rows.len() > MAX_LEDGER_ROWS {
+            self.rows
+                .sort_by_key(|row| std::cmp::Reverse(row.updated_at));
+            self.rows.truncate(MAX_LEDGER_ROWS);
+        }
+    }
+
+    /// 写不进去不是致命错误：账还在内存里，这次运行照样报得出去，只是重启会丢。
+    fn persist(&self) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        match serde_json::to_string(&self.rows) {
+            Ok(body) => {
+                if let Err(err) = write_atomically(path, &body) {
+                    tracing::debug!("codext: could not persist the usage ledger: {err}");
+                }
+            }
+            Err(err) => tracing::debug!("codext: could not encode the usage ledger: {err}"),
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// 一次模型调用刚结束：把这次用掉的 token 记到**此刻手上那个号**头上。
+///
+/// 这是整套用量统计唯一的记账点，也是唯一同时知道 token 数、账号和模型的地方。
+/// 上游在 `Session::record_token_usage_info` 里调它——那正是收到
+/// `ResponseEvent::Completed` 之后、拿到这一次调用用量的位置。
+///
+/// 换号只发生在两次调用之间（服务端对能用的号有黏性，只有被拒才换），所以"此刻
+/// 手上的号"就是刚才服务这次调用的号。
+pub fn record_turn_usage(session_id: &str, model: &str, usage: &codex_protocol::protocol::TokenUsage) {
+    if session_id.is_empty() {
+        return;
+    }
+    let Ok(mut ledger) = LEDGER.lock() else {
+        return;
+    };
+    // 没租到号的时候跑的用量不是池子的，记上去就是凭空给某个号栽赃。
+    let Some(account_key) = ledger.held.clone() else {
+        return;
+    };
+    let now = unix_now();
+    let row = ledger.find(session_id, &account_key, model);
+    row.counters.add_turn(usage);
+    row.updated_at = now;
+    ledger.prune(now);
+    ledger.persist();
+}
+
+/// 手上这个号刚被 OpenAI 以「配额用尽」拒绝。
+///
+/// 这是**拒绝**不是**读数**：它是对方明确的答复，报错了也只会让报告者自己失去手上
+/// 这个号。服务端据此立刻把号按下去——否则它只能等后台观测（最快 30 秒）才知道，
+/// 而这期间会一次次把同一个已经跑满的号发回给正在重试的会话。
+pub fn report_account_refused() {
+    if let Ok(mut ledger) = LEDGER.lock() {
+        ledger.refused = true;
+    }
+}
+
+fn set_held_account(account_key: Option<String>) {
+    if let Ok(mut ledger) = LEDGER.lock() {
+        ledger.held = account_key;
+    }
+}
+
+/// 有没有一条还没送达服务端的拒绝。
+fn refusal_pending() -> bool {
+    LEDGER.lock().map(|ledger| ledger.refused).unwrap_or(false)
+}
+
+/// 拒绝已经报到服务端了，销账。只在派号请求成功之后调。
+fn clear_refusal() {
+    if let Ok(mut ledger) = LEDGER.lock() {
+        ledger.refused = false;
+    }
+}
+
+/// 账本里所有还留着的账，按服务端的形状打包。
+///
+/// **报完不删。** 上报的是累计值、服务端取较大值，所以重复报是空操作；而"发出去了
+/// 但回包丢了"和"根本没发出去"在客户端看来一模一样，删掉就等于赌它送到了。裁剪交给
+/// [`Ledger::prune`] 按时间做。
+fn pending_usage() -> Vec<SessionUsage> {
+    let Ok(ledger) = LEDGER.lock() else {
+        return Vec::new();
+    };
+    ledger
+        .rows
+        .iter()
+        .map(|row| SessionUsage {
+            session_id: row.session_id.clone(),
+            counter_version: USAGE_COUNTER_VERSION,
+            account_key: Some(row.account_key.clone()),
+            model: (!row.model.is_empty()).then(|| row.model.clone()),
+            requests: row.counters.requests,
+            input_tokens: row.counters.input_tokens,
+            cached_input_tokens: row.counters.cached_input_tokens,
+            output_tokens: row.counters.output_tokens,
+            reasoning_tokens: row.counters.reasoning_tokens,
+            total_tokens: row.counters.total_tokens,
+        })
+        .collect()
+}
+
 /// 配了池子就接管凭据来源；没配就什么都不做，codext 退回上游原本的 auth.json。
 ///
 /// 配了也不等于绑死：池子给不出号的时候 `AuthManager::load_auth` 会退回本机
@@ -165,7 +351,8 @@ pub(super) async fn install_if_configured(manager: &Arc<AuthManager>, codex_home
         "codext: leasing credentials from the pool as device {}",
         config.device_id
     );
-    let pool = Arc::new(PoolAuth::new(config, codex_home.to_path_buf()));
+    attach_ledger(codex_home);
+    let pool = Arc::new(PoolAuth::new(config));
     // 装不上（池子不可达、密钥不对）不该让 codext 起不来：留在本地认证上，
     // 用户至少还能用自己 `codex login` 登过的号。
     if let Err(err) = manager.set_external_auth(pool.clone()).await {
@@ -173,6 +360,23 @@ pub(super) async fn install_if_configured(manager: &Arc<AuthManager>, codex_home
         return;
     }
     spawn_idle_tick(pool);
+}
+
+/// 把账本接到 `CODEX_HOME`，并读回上次运行没报完的账。
+///
+/// 读不出来就从空账本开始：文件损坏、或者上一版留下的旧格式，都不该让 codext 起不来。
+/// 代价只是丢掉上次运行的尾巴，而那笔账多半已经报上去过了。
+fn attach_ledger(codex_home: &Path) {
+    let path = codex_home.join(LEDGER_FILE);
+    let rows = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<LedgerRow>>(&raw).ok())
+        .unwrap_or_default();
+    if let Ok(mut ledger) = LEDGER.lock() {
+        ledger.path = Some(path);
+        ledger.rows = rows;
+        ledger.prune(unix_now());
+    }
 }
 
 /// 安静的时候也定期找一次池子。
@@ -279,44 +483,21 @@ struct Lease {
     decided_at: Instant,
 }
 
-/// 上次扫 rollout 的节流状态。
-struct Scan {
-    /// 本次运行开始的时刻。决定一个没有归属记录的会话能不能算我们的——见
-    /// [`collect_sessions`] 第 3 条。
-    started: SystemTime,
-    next: Instant,
-    saw_current_rollout: bool,
-}
-
-#[derive(Default)]
-struct ScanOutcome {
-    sessions: Vec<SessionUsage>,
-    saw_current_rollout: bool,
-}
-
 struct PoolAuth {
     config: Config,
     client: HttpClient,
-    codex_home: PathBuf,
     /// 手上这份凭据。**只有两个用途**：告诉服务端"我现在用的是哪个号"，以及在
     /// 池子不可达时兜底。它不做决策短路——每个请求都要重新派一次号，手上这个还
     /// 能不能接着用由服务端判定。
     lease: RwLock<Option<Lease>>,
-    scan: RwLock<Scan>,
 }
 
 impl PoolAuth {
-    fn new(config: Config, codex_home: PathBuf) -> Self {
+    fn new(config: Config) -> Self {
         Self {
             config,
             client: create_client(),
-            codex_home,
             lease: RwLock::new(None),
-            scan: RwLock::new(Scan {
-                started: SystemTime::now(),
-                next: Instant::now(),
-                saw_current_rollout: false,
-            }),
         }
     }
 
@@ -326,36 +507,36 @@ impl PoolAuth {
     /// （access token 通常还有十几分钟有效期，一次网络抖动不该打断会话）；凭据
     /// 刚被 401 拒绝时不行——那份已经被对面拒了，再用一次只会再失败一次。
     async fn current(&self, allow_stale: bool) -> std::io::Result<CodexAuth> {
-        let recent = allow_stale.then(|| self.recent_decision()).flatten();
-        if recent.is_some() && self.saw_current_rollout() {
-            return Ok(recent.expect("checked above"));
-        }
-        let held = self.held_account();
-        // 没有 held 也要扫：上次进程退出前的最后一轮，要按持久化归属补报。
-        let outcome = self.scan_usage(held.as_deref(), false, None).await?;
-        if let Some(auth) = recent
-            && !outcome.saw_current_rollout
+        let refused = refusal_pending();
+        // 有待报的拒绝时不能走合并窗：那份"刚刚的决定"正是刚被拒的那个号。
+        if !refused
+            && let Some(auth) = allow_stale.then(|| self.recent_decision()).flatten()
         {
             return Ok(auth);
         }
-        let reject = (!allow_stale).then_some(REJECT_UNAUTHORIZED);
-        match self.post(held.as_deref(), reject, outcome.sessions).await {
+        let held = self.held_account();
+        let reject = if refused {
+            Some(REJECT_USAGE_LIMIT)
+        } else {
+            (!allow_stale).then_some(REJECT_UNAUTHORIZED)
+        };
+        let posted = self.post(held.as_deref(), reject).await;
+        // **送到了才清标记。** 提前清掉的话，一次网络失败就永久丢掉这条消息，服务端
+        // 再也不知道这个号满了，于是一次次把它发回来——正是要修的那个死循环。
+        if refused && posted.is_ok() {
+            clear_refusal();
+        }
+        match posted {
             Ok(Some(data)) => {
                 let account_key = data.account_key.clone();
                 let auth = match Self::validate(&data) {
                     Ok(auth) => auth,
                     Err(err) => {
-                        self.abandon_current(held.as_deref()).await?;
+                        self.abandon_current().await?;
                         return Err(err);
                     }
                 };
                 mark_pool_serving();
-                if held.as_deref() != Some(data.account_key.as_str()) {
-                    // 常规扫描可能正处在 5 秒节流窗内。切号前强制结清旧账号，随后
-                    // 原子记下新账号；否则这几秒的尾巴会在下一轮被记到新号头上。
-                    self.scan_usage(held.as_deref(), true, Some(Some(data.account_key.as_str())))
-                        .await?;
-                }
                 Ok(self.store(account_key, auth))
             }
             // 「此刻没号可发」是确定的答复，不是抖动：手上那份多半正是服务端刚决定
@@ -364,7 +545,7 @@ impl PoolAuth {
             // auth.json；下一个请求照样会再问池子一次，号一回来就自动切回去。
             Ok(None) => {
                 mark_pool_exhausted();
-                self.abandon_current(held.as_deref()).await?;
+                self.abandon_current().await?;
                 Err(std::io::Error::other("no account available in the pool"))
             }
             Err(err) if allow_stale => match self.cached_auth() {
@@ -373,71 +554,20 @@ impl PoolAuth {
                     Ok(auth)
                 }
                 None => {
-                    self.abandon_current(held.as_deref()).await?;
+                    self.abandon_current().await?;
                     Err(err)
                 }
             },
             Err(err) => {
-                self.abandon_current(held.as_deref()).await?;
+                self.abandon_current().await?;
                 Err(err)
             }
         }
     }
 
-    async fn abandon_current(&self, held: Option<&str>) -> std::io::Result<()> {
-        let result = self.scan_usage(held, true, Some(None)).await;
+    async fn abandon_current(&self) -> std::io::Result<()> {
         self.forget_lease();
-        result.map(|_| ())
-    }
-
-    /// 扫一遍最近的 rollout，取出用量和额度读数，并记下每个会话归谁。
-    ///
-    /// 节流到 [`USAGE_SCAN_MIN_INTERVAL`]：派号是每个请求一次，重读几 MB 的会话
-    /// 文件没必要跟着这么密。服务端按 (session_id, account_key) 去重、计数取较大
-    /// 值，所以少报一轮或重复报都无害。
-    async fn scan_usage(
-        &self,
-        held: Option<&str>,
-        force: bool,
-        transition: Option<Option<&str>>,
-    ) -> std::io::Result<ScanOutcome> {
-        let started = {
-            let Ok(mut guard) = self.scan.write() else {
-                return Err(std::io::Error::other("usage scan lock is poisoned"));
-            };
-            let now = Instant::now();
-            if !force && guard.saw_current_rollout && now < guard.next {
-                return Ok(ScanOutcome::default());
-            }
-            guard.next = now + USAGE_SCAN_MIN_INTERVAL;
-            guard.started
-        };
-        let home = self.codex_home.clone();
-        let held = held.map(str::to_string);
-        let transition = transition.map(|account| account.map(str::to_string));
-        // 扫目录和读文件都是阻塞 IO，不能直接压在异步线程上。
-        let outcome = tokio::task::spawn_blocking(move || {
-            try_collect_sessions(
-                &home,
-                held.as_deref(),
-                started,
-                transition.as_ref().map(|account| account.as_deref()),
-            )
-        })
-        .await
-        .map_err(std::io::Error::other)??;
-        let mut guard = self
-            .scan
-            .write()
-            .map_err(|_| std::io::Error::other("usage scan lock is poisoned"))?;
-        if outcome.saw_current_rollout {
-            guard.saw_current_rollout = true;
-        } else {
-            // A startup scan before the rollout exists must not consume the
-            // five-second window; the next auth lookup needs to claim it.
-            guard.next = Instant::now();
-        }
-        Ok(outcome)
+        Ok(())
     }
 
     /// 向池子要一个号。`Ok(None)` 是「此刻没号可发」——那是服务端的正常答复，
@@ -446,8 +576,8 @@ impl PoolAuth {
         &self,
         account_key: Option<&str>,
         reject: Option<&str>,
-        sessions: Vec<SessionUsage>,
     ) -> std::io::Result<Option<LeaseData>> {
+        let sessions = pending_usage();
         let url = format!("{}{PATH_PREFIX}/lease", self.config.base_url);
         let response = self
             .client
@@ -494,6 +624,7 @@ impl PoolAuth {
     }
 
     fn store(&self, account_key: String, auth: CodexAuth) -> CodexAuth {
+        set_held_account(Some(account_key.clone()));
         if let Ok(mut guard) = self.lease.write() {
             *guard = Some(Lease {
                 account_key,
@@ -502,13 +633,6 @@ impl PoolAuth {
             });
         }
         auth
-    }
-
-    fn saw_current_rollout(&self) -> bool {
-        self.scan
-            .read()
-            .map(|guard| guard.saw_current_rollout)
-            .unwrap_or(false)
     }
 
     /// 刚刚才决定过的话就用那次的结果。见 [`DECISION_COALESCE`]。
@@ -528,6 +652,7 @@ impl PoolAuth {
     /// 留着的话下一个请求还会把它当作「我手上的号」报上去，连带把**退回本地之后**
     /// 跑掉的用量和额度读数记到它头上——那是调度赖以判断的读数，污染不得。
     fn forget_lease(&self) {
+        set_held_account(None);
         if let Ok(mut guard) = self.lease.write() {
             *guard = None;
         }
@@ -554,9 +679,15 @@ impl ExternalAuth for PoolAuth {
     }
 }
 
-/// 上游的 `ExternalAuthRefreshReason` 只有 `Unauthorized` 一个变体，所以报上去的
-/// 理由也只有这一个。配额耗尽走不到这里：那个由每个请求带回来的读数自己体现。
+/// 上游的 `ExternalAuthRefreshReason` 只有 `Unauthorized` 一个变体，所以走
+/// [`ExternalAuth::refresh`] 报上来的理由只有这一个。
 const REJECT_UNAUTHORIZED: &str = "unauthorized";
+
+/// 手上这个号被 OpenAI 判了配额用尽。见 [`report_account_refused`]。
+///
+/// 和 401 分开报：401 是"这份令牌该续期了"，等一轮就好；配额用尽要等整个窗口重置，
+/// 两者的回避时长差着几个数量级，混成一个理由必然有一边是错的。
+const REJECT_USAGE_LIMIT: &str = "usage_limit";
 
 #[derive(Serialize)]
 struct PoolRequest<'a> {
@@ -614,476 +745,6 @@ struct SessionUsage {
     output_tokens: u64,
     reasoning_tokens: u64,
     total_tokens: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rate_limits: Option<RateLimits>,
-}
-
-#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
-struct UsageCounters {
-    requests: u64,
-    input_tokens: u64,
-    cached_input_tokens: u64,
-    output_tokens: u64,
-    reasoning_tokens: u64,
-    total_tokens: u64,
-}
-
-impl UsageCounters {
-    fn from_usage(usage: &SessionUsage) -> Self {
-        Self {
-            requests: usage.requests,
-            input_tokens: usage.input_tokens,
-            cached_input_tokens: usage.cached_input_tokens,
-            output_tokens: usage.output_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
-            total_tokens: usage.total_tokens,
-        }
-    }
-
-    fn saturating_sub(self, previous: Self) -> Self {
-        Self {
-            requests: self.requests.saturating_sub(previous.requests),
-            input_tokens: self.input_tokens.saturating_sub(previous.input_tokens),
-            cached_input_tokens: self
-                .cached_input_tokens
-                .saturating_sub(previous.cached_input_tokens),
-            output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
-            reasoning_tokens: self
-                .reasoning_tokens
-                .saturating_sub(previous.reasoning_tokens),
-            total_tokens: self.total_tokens.saturating_sub(previous.total_tokens),
-        }
-    }
-
-    fn add_assign(&mut self, delta: Self) {
-        self.requests = self.requests.saturating_add(delta.requests);
-        self.input_tokens = self.input_tokens.saturating_add(delta.input_tokens);
-        self.cached_input_tokens = self
-            .cached_input_tokens
-            .saturating_add(delta.cached_input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(delta.output_tokens);
-        self.reasoning_tokens = self.reasoning_tokens.saturating_add(delta.reasoning_tokens);
-        self.total_tokens = self.total_tokens.saturating_add(delta.total_tokens);
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct SessionAttribution {
-    active_account: Option<String>,
-    #[serde(default)]
-    last_seen: UsageCounters,
-    #[serde(default)]
-    accounts: BTreeMap<String, UsageCounters>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-enum StoredAttribution {
-    Legacy(String),
-    Current(SessionAttribution),
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq)]
-struct RateLimits {
-    observed_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    plan: Option<String>,
-    windows: Vec<RateWindow>,
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq)]
-struct RateWindow {
-    window_minutes: u64,
-    used_percent: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resets_at: Option<i64>,
-}
-
-/// 最近动过的会话，按真正服务它的账号拆成完整累计快照。
-///
-/// `transition` 为 `Some` 时是一次账号切换：先把新增用量结给旧的
-/// `active_account`，再在同一次文件写回里切到新账号。`Some(None)` 表示退回本地
-/// auth；这期间只推进基线，不把用量记到任何池账号。
-fn try_collect_sessions(
-    codex_home: &Path,
-    held: Option<&str>,
-    started: SystemTime,
-    transition: Option<Option<&str>>,
-) -> std::io::Result<ScanOutcome> {
-    let lock_path = codex_home.join(ATTRIBUTION_LOCK_FILE);
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-    lock_file.lock()?;
-
-    let mut attributions = load_attribution(codex_home)?;
-    let mut seen = Vec::new();
-    let mut sessions = Vec::new();
-    let mut saw_current_rollout = false;
-    for (modified, path) in recent_rollouts(codex_home) {
-        let is_current_rollout = modified >= started;
-        saw_current_rollout |= is_current_rollout;
-        let session_id = rollout_session_id(&path);
-        if session_id.is_empty() {
-            continue;
-        }
-        let usage = read_rollout(&path);
-        let stored = attributions.remove(&session_id);
-        let (mut attribution, migrated_legacy) = match stored {
-            Some(StoredAttribution::Current(attribution)) => (attribution, false),
-            Some(StoredAttribution::Legacy(owner)) => {
-                let mut accounts = BTreeMap::new();
-                let last_seen = usage
-                    .as_ref()
-                    .map(UsageCounters::from_usage)
-                    .unwrap_or_default();
-                if usage.is_some() {
-                    accounts.insert(owner.clone(), last_seen);
-                }
-                (
-                    SessionAttribution {
-                        active_account: Some(owner),
-                        last_seen,
-                        accounts,
-                    },
-                    true,
-                )
-            }
-            None if is_current_rollout && (held.is_some() || transition.is_some()) => (
-                SessionAttribution {
-                    active_account: held.map(str::to_string),
-                    last_seen: UsageCounters::default(),
-                    accounts: BTreeMap::new(),
-                },
-                false,
-            ),
-            None => continue,
-        };
-        seen.push(session_id.clone());
-
-        let rate_limit_account = attribution.active_account.clone();
-        if let Some(usage) = usage.as_ref()
-            && !migrated_legacy
-        {
-            let current = UsageCounters::from_usage(usage);
-            let delta = current.saturating_sub(attribution.last_seen);
-            if let Some(owner) = attribution.active_account.as_ref() {
-                attribution
-                    .accounts
-                    .entry(owner.clone())
-                    .or_default()
-                    .add_assign(delta);
-            }
-            attribution.last_seen = current;
-        }
-
-        if let Some(next_account) = transition
-            && is_current_rollout
-            && (held.is_none() || attribution.active_account.as_deref() == held)
-        {
-            attribution.active_account = next_account.map(str::to_string);
-        } else if migrated_legacy && held.is_some() && is_current_rollout {
-            // 旧文件只有历史 owner；完整旧用量留给它，从现在开始的新 delta 归当前号。
-            attribution.active_account = held.map(str::to_string);
-        }
-
-        let Some(usage) = usage else {
-            attributions.insert(session_id, StoredAttribution::Current(attribution));
-            continue;
-        };
-        for (account_key, counters) in &attribution.accounts {
-            sessions.push(SessionUsage {
-                session_id: session_id.clone(),
-                counter_version: USAGE_COUNTER_VERSION,
-                account_key: Some(account_key.clone()),
-                model: usage.model.clone(),
-                requests: counters.requests,
-                input_tokens: counters.input_tokens,
-                cached_input_tokens: counters.cached_input_tokens,
-                output_tokens: counters.output_tokens,
-                reasoning_tokens: counters.reasoning_tokens,
-                total_tokens: counters.total_tokens,
-                rate_limits: if rate_limit_account.as_deref() == Some(account_key.as_str()) {
-                    usage.rate_limits.clone()
-                } else {
-                    None
-                },
-            });
-        }
-        attributions.insert(session_id, StoredAttribution::Current(attribution));
-    }
-    save_attribution(codex_home, &attributions, &seen)?;
-    Ok(ScanOutcome {
-        sessions,
-        saw_current_rollout,
-    })
-}
-
-#[cfg(test)]
-fn collect_sessions(
-    codex_home: &Path,
-    held: Option<&str>,
-    started: SystemTime,
-    transition: Option<Option<&str>>,
-) -> Vec<SessionUsage> {
-    try_collect_sessions(codex_home, held, started, transition)
-        .expect("collect pool sessions")
-        .sessions
-}
-
-/// 最近动过的 rollout，最新的在前，带上各自的修改时间。
-fn recent_rollouts(codex_home: &Path) -> Vec<(SystemTime, PathBuf)> {
-    let since = SystemTime::now()
-        .checked_sub(Duration::from_secs(REPORT_WINDOW_SECONDS))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    let mut found = Vec::new();
-    collect_rollouts(&codex_home.join("sessions"), since, 0, &mut found);
-    found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    found.truncate(MAX_ROLLOUTS);
-    found
-}
-
-fn attribution_path(codex_home: &Path) -> PathBuf {
-    codex_home.join(ATTRIBUTION_FILE)
-}
-
-fn load_attribution(codex_home: &Path) -> std::io::Result<HashMap<String, StoredAttribution>> {
-    let raw = match std::fs::read_to_string(attribution_path(codex_home)) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(err) => return Err(err),
-    };
-    serde_json::from_str(&raw).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid pool session attribution: {err}"),
-        )
-    })
-}
-
-/// 存回归属表，只留最近扫到的那些。
-///
-/// 按「这一批扫到了什么」裁剪而不是按条数裁：扫的范围本来就是最近这段时间，超出
-/// 那个范围的会话再也不会被上报，留着只会让文件无限长下去。
-fn save_attribution(
-    codex_home: &Path,
-    attributions: &HashMap<String, StoredAttribution>,
-    seen: &[String],
-) -> std::io::Result<()> {
-    let kept: BTreeMap<&str, &StoredAttribution> = seen
-        .iter()
-        .take(MAX_ATTRIBUTIONS)
-        .filter_map(|session_id| {
-            attributions
-                .get(session_id)
-                .map(|attribution| (session_id.as_str(), attribution))
-        })
-        .collect();
-    let body = serde_json::to_string(&kept).map_err(std::io::Error::other)?;
-    write_atomically(&attribution_path(codex_home), &body)
-}
-
-fn collect_rollouts(
-    dir: &Path,
-    since: SystemTime,
-    depth: usize,
-    out: &mut Vec<(SystemTime, PathBuf)>,
-) {
-    // 布局是 sessions/YYYY/MM/DD/rollout-*.jsonl，给一层余量。
-    if depth > 4 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let path = entry.path();
-        if meta.is_dir() {
-            collect_rollouts(&path, since, depth + 1, out);
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
-            continue;
-        }
-        // 本次运行开始之后没再动过的，要么早报过、要么根本属于别的账号。
-        if let Ok(modified) = meta.modified()
-            && modified >= since
-        {
-            out.push((modified, path));
-        }
-    }
-}
-
-/// 读一个 rollout 的用量。
-///
-/// Codex 每次模型调用写一条 `token_count` 事件，`info` 里既有 `total_token_usage`
-/// （线程累计）也有 `last_token_usage`（这一次）。fork 出来的子线程会继承父线程的
-/// 累计值，所以现代 rollout 必须把每条 `last_token_usage` 相加；取最后一条累计值会
-/// 把父线程的整段历史在每个子线程里再算一遍。
-///
-/// 同一次调用偶尔会落两条完全相同的累计快照，请求数和增量都只算一次。没有
-/// `last_token_usage` 的旧 rollout 才退回最后一条累计值。
-fn read_rollout(path: &Path) -> Option<SessionUsage> {
-    let session_id = rollout_session_id(path);
-    if session_id.is_empty() {
-        return None;
-    }
-    let file = std::fs::File::open(path).ok()?;
-    let mut usage = SessionUsage {
-        session_id,
-        counter_version: USAGE_COUNTER_VERSION,
-        ..SessionUsage::default()
-    };
-    let mut seen = false;
-    let mut last_cumulative = None;
-    let mut incremental = [0_u64; 5];
-    let mut all_events_have_incremental = true;
-    let mut saw_incremental = false;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.contains("token_count") && !line.contains("turn_context") {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let payload = event.get("payload").unwrap_or(&event);
-        let event_type = event
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| payload.get("type").and_then(serde_json::Value::as_str));
-        if event_type == Some("turn_context")
-            && let Some(model) = payload.get("model").and_then(serde_json::Value::as_str)
-        {
-            usage.model = Some(model.to_string());
-        }
-        if payload.get("type").and_then(serde_json::Value::as_str) != Some("token_count") {
-            continue;
-        }
-        if let Some(model) = payload.get("model").and_then(serde_json::Value::as_str) {
-            usage.model = Some(model.to_string());
-        }
-        // 留最后一条读数：最新的那次调用才反映账号此刻的额度。
-        if let Some(limits) = read_rate_limits(payload, &event) {
-            usage.rate_limits = Some(limits);
-        }
-        // OpenAI 会单独落一条 `info: null` 的额度刷新事件。它不是模型调用，不能
-        // 增加请求数、更不能把现代 rollout 降级到含父线程基线的累计口径。
-        let Some(info) = payload.get("info").filter(|value| value.is_object()) else {
-            continue;
-        };
-        seen = true;
-        if let Some(model) = info.get("model").and_then(serde_json::Value::as_str) {
-            usage.model = Some(model.to_string());
-        }
-        // 相同累计快照是同一次调用的重复落盘。额度读数仍取最新，但用量不重算。
-        let totals = info.get("total_token_usage").unwrap_or(info);
-        let cumulative = token_counts(totals);
-        if last_cumulative == Some(cumulative) {
-            continue;
-        }
-        last_cumulative = Some(cumulative);
-        usage.requests += 1;
-        if let Some(last) = info.get("last_token_usage") {
-            saw_incremental = true;
-            for (sum, value) in incremental.iter_mut().zip(token_counts(last)) {
-                *sum = sum.saturating_add(value);
-            }
-        } else {
-            all_events_have_incremental = false;
-        }
-    }
-    let counts = if saw_incremental && all_events_have_incremental {
-        incremental
-    } else {
-        last_cumulative.unwrap_or_default()
-    };
-    if seen {
-        usage.input_tokens = counts[0];
-        usage.cached_input_tokens = counts[1];
-        usage.output_tokens = counts[2];
-        usage.reasoning_tokens = counts[3];
-        usage.total_tokens = counts[4];
-    }
-    seen.then_some(usage)
-}
-
-fn token_counts(value: &serde_json::Value) -> [u64; 5] {
-    [
-        token_field(value, "input_tokens"),
-        token_field(value, "cached_input_tokens"),
-        token_field(value, "output_tokens"),
-        token_field(value, "reasoning_output_tokens").max(token_field(value, "reasoning_tokens")),
-        token_field(value, "total_tokens"),
-    ]
-}
-
-fn token_field(value: &serde_json::Value, name: &str) -> u64 {
-    value
-        .get(name)
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
-}
-
-/// 从一条 `token_count` 事件里取出额度窗口。
-///
-/// 哪个槽位装哪个窗不固定：Plus 的 `primary` 是 5h 窗、`secondary` 是周窗，Pro 只
-/// 有一个周窗的 `primary`。所以槽位名一律丢掉，含义由 `window_minutes` 承载——认
-/// 槽位名会把 Pro 的周用量标成 5h。
-fn read_rate_limits(payload: &serde_json::Value, event: &serde_json::Value) -> Option<RateLimits> {
-    let limits = payload.get("rate_limits")?;
-    let windows: Vec<RateWindow> = ["primary", "secondary"]
-        .iter()
-        .filter_map(|slot| limits.get(slot))
-        .filter_map(|window| {
-            Some(RateWindow {
-                window_minutes: window.get("window_minutes")?.as_u64()?,
-                used_percent: window.get("used_percent")?.as_f64()?,
-                resets_at: window.get("resets_at").and_then(serde_json::Value::as_i64),
-            })
-        })
-        .collect();
-    if windows.is_empty() {
-        // 两次刷新之间 OpenAI 会发全 null 的窗口，那不代表"用量为零"。
-        return None;
-    }
-    Some(RateLimits {
-        observed_at: event
-            .get("timestamp")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        plan: limits
-            .get("plan_type")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        windows,
-    })
-}
-
-/// rollout 文件名里嵌的会话 id：`rollout-<时间戳>-<uuid>.jsonl`。
-///
-/// uuid 是最后五个短横分段——时间戳里也有短横，从前面数会切错。
-fn rollout_session_id(path: &Path) -> String {
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-        return String::new();
-    };
-    let Some(rest) = stem.strip_prefix("rollout-") else {
-        return String::new();
-    };
-    let parts: Vec<&str> = rest.split('-').collect();
-    if parts.len() < 5 {
-        return String::new();
-    }
-    parts[parts.len() - 5..].join("-")
 }
 
 #[cfg(test)]

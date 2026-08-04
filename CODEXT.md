@@ -5,18 +5,29 @@
 存在的唯一理由：**让 Codex 的凭据来自一个自建的账号池服务，而不是本机的
 `auth.json`**。一个人跑很多项目，用量摊在若干个账号上，谁都不像机器。
 
-## 上游footprint：两个文件，三个挂钩点
+## 上游footprint：挂钩点
 
 | 文件 | 改动 | 近 5 版上游改动次数 |
 | --- | --- | --- |
-| `codex-rs/login/src/auth/mod.rs` | `mod pool;` | 1 |
+| `codex-rs/login/src/auth/mod.rs` | `mod pool;` 和几个 re-export | 1 |
 | `codex-rs/login/src/auth/manager.rs` `shared()` | 装 provider | **0** |
 | `codex-rs/login/src/auth/manager.rs` `load_auth()` | 池子给不出号时退回本地 | 3 |
 | `codex-rs/login/src/auth/manager.rs` 续期分流 | 本地那份走本地续期 | 3 |
+| `codex-rs/core/src/session/mod.rs` `record_token_usage_info()` | 一次调用结束时记用量 | — |
+| `codex-rs/core/src/responses_retry.rs` `RetryKind::of()` | 撞墙时上报被拒 | — |
 | `codex-rs/login/src/auth/pool.rs` | 新文件，全部实现 | — |
 | `codex-rs/login/src/auth/pool_tests.rs` | 新文件 | — |
 
 没有新增依赖，没有动 `Cargo.toml`。
+
+`core` 侧的两个挂钩点都是一句静态函数调用，和早先的 `pool_is_exhausted()` 同一个
+形状——`login` 不能反向依赖 `core`（会成环），所以走进程级静态而不是注册回调。
+挑这两个位置的理由和挑 `shared()` 一样，是它们各自唯一：`record_token_usage_info`
+是所有 `ResponseEvent::Completed` 的必经之路，`RetryKind::of` 是所有重试分类的
+必经之路。
+
+`responses_retry.rs` 里还有一批更早的换号/重试改动（`RetryKind` 那一整套）没有在
+这张表里逐条列出，合并上游时要连整个文件一起核对。
 
 挂钩点是按**函数级** churn 选的，不是文件级：`manager.rs` 在最近 5 个 release
 里改了 14 次，但 `shared()` 一次没改过。后两个挂钩点在 `load_auth()` 附近，那里

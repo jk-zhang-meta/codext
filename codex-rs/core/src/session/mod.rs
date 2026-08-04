@@ -3743,6 +3743,12 @@ impl Session {
         token_usage: Option<&TokenUsage>,
     ) -> CodexResult<()> {
         if let Some(token_usage) = token_usage {
+            // codext: 这一次调用刚结束，是唯一同时知道 token 数、账号和模型的位置。
+            codex_login::record_turn_usage(
+                &self.thread_id().to_string(),
+                turn_context.model_info.slug.as_str(),
+                token_usage,
+            );
             let token_info = {
                 let mut state = self.state.lock().await;
                 state
