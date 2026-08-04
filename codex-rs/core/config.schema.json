@@ -2180,6 +2180,10 @@
           "description": "Tracks whether the user opted out of the rate limit model switch reminder.",
           "type": "boolean"
         },
+        "hide_safety_buffering_retry_prompt": {
+          "description": "Tracks whether the user opted out of the safety-buffering retry menu. The menu itself says no action is required, and the status line carries the same message, so hiding it costs no information.",
+          "type": "boolean"
+        },
         "hide_world_writable_warning": {
           "description": "Tracks whether the user has acknowledged the Windows world-writable directories warning.",
           "type": "boolean"

@@ -302,6 +302,29 @@ async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
     assert!(!render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
 }
 
+/// Hiding the retry menu must cost the operator no information: the status line
+/// carries the same sentence the menu leads with, and it is set from the same
+/// notification, so the only thing suppressed is the interruption.
+#[tokio::test]
+async fn safety_buffering_retry_menu_can_be_hidden() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.notices.hide_safety_buffering_retry_prompt = Some(true);
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id,
+            turn_id,
+            Some("faster-model"),
+        )),
+        /*replay_kind*/ None,
+    );
+
+    let rendered = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!rendered.contains("Retry with a faster model"));
+    assert!(rendered.contains(SAFETY_BUFFERING_HEADER_TEXT));
+}
+
 #[tokio::test]
 async fn invalid_url_elicitation_is_declined() {
     let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;

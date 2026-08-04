@@ -47,6 +47,26 @@ impl ChatWidget {
         }
     }
 
+    /// Whether the retry menu is allowed to open when the server reports that a
+    /// request is being safety-buffered.
+    ///
+    /// The menu offers "Retry with a faster model" and, by its own footer, is
+    /// not a question the operator has to answer: Codex keeps waiting either
+    /// way and the menu closes itself once the response arrives. The sentence
+    /// it leads with is already on the status line, set from the same data a
+    /// few statements further down. On a host that never takes the retry it
+    /// therefore costs the bottom pane mid-turn and returns nothing.
+    ///
+    /// Only the menu is suppressed. The status line still reports the
+    /// buffering, and `RetrySafetyBufferedTurn` is untouched, so both the
+    /// information and the retry path survive.
+    fn safety_buffering_retry_prompt_hidden(&self) -> bool {
+        self.config
+            .notices
+            .hide_safety_buffering_retry_prompt
+            .unwrap_or(false)
+    }
+
     pub(super) fn safety_buffering_is_waiting(&self) -> bool {
         self.safety_buffering
             .active
@@ -156,7 +176,7 @@ impl ChatWidget {
             /*details_max_lines*/ 6,
         );
 
-        if !should_show_prompt {
+        if self.safety_buffering_retry_prompt_hidden() || !should_show_prompt {
             return;
         }
         self.bottom_pane
