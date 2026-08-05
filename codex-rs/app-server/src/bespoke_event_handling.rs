@@ -1589,6 +1589,8 @@ async fn handle_token_count_event(
             .send_server_notification(ServerNotification::AccountRateLimitsUpdated(
                 AccountRateLimitsUpdatedNotification {
                     rate_limits: rate_limits.into(),
+                    // 取的是全局账本里那条记录，不是问租约——问租约会重新派号。
+                    account_email: codex_login::held_account_email(),
                 },
             ))
             .await;

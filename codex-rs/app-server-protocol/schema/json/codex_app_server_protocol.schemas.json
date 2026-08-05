@@ -6109,6 +6109,13 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Sparse rolling rate-limit update.\n\nClients should merge available values into the most recent `account/rateLimits/read` response or refetch that snapshot. Nullable account metadata may be unavailable in a rolling update and does not clear a previously observed value.",
         "properties": {
+          "accountEmail": {
+            "description": "The account these readings belong to, when it is knowable.\n\nWith a credential pool the serving account can differ from one request to the next, so an email read at any other moment describes a different account than the percentages above. Carrying it here is what keeps the two from disagreeing: they arrive together or not at all.\n\n`None` means unknown — per this notification's sparse-update contract it leaves a previously observed value alone rather than clearing it.\n\nPlain `Option`, no `skip_serializing_if`: outside `*Params` types this schema forbids a field that is both optional and nullable, and `generated_ts_optional_nullable_fields_only_in_params` enforces it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rateLimits": {
             "$ref": "#/definitions/v2/RateLimitSnapshot"
           }

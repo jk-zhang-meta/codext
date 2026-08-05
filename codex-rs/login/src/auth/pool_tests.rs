@@ -87,10 +87,10 @@ fn usage_follows_the_account_that_served_the_turn() {
     let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
     reset_ledger(None);
 
-    super::set_held_account(Some("acct-a".to_string()));
+    super::set_held_account(Some("acct-a".to_string()), None);
     super::record_turn_usage("s-1", "gpt-5", &turn(100));
     super::record_turn_usage("s-1", "gpt-5", &turn(50));
-    super::set_held_account(Some("acct-b".to_string()));
+    super::set_held_account(Some("acct-b".to_string()), None);
     super::record_turn_usage("s-1", "gpt-5", &turn(7));
 
     let reported = super::pending_usage();
@@ -110,7 +110,7 @@ fn each_model_keeps_its_own_line() {
     let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
     reset_ledger(None);
 
-    super::set_held_account(Some("acct-a".to_string()));
+    super::set_held_account(Some("acct-a".to_string()), None);
     super::record_turn_usage("s-1", "gpt-5", &turn(10));
     super::record_turn_usage("s-1", "gpt-5-codex", &turn(300));
 
@@ -127,7 +127,7 @@ fn usage_without_a_lease_is_charged_to_nobody() {
     let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
     reset_ledger(None);
 
-    super::set_held_account(None);
+    super::set_held_account(None, None);
     super::record_turn_usage("s-1", "gpt-5", &turn(999));
 
     assert!(super::pending_usage().is_empty());
@@ -161,7 +161,7 @@ fn the_ledger_survives_a_restart() {
     let home = tempfile::tempdir().expect("tempdir");
     reset_ledger(Some(home.path().join(super::LEDGER_FILE)));
 
-    super::set_held_account(Some("acct-a".to_string()));
+    super::set_held_account(Some("acct-a".to_string()), None);
     super::record_turn_usage("s-1", "gpt-5", &turn(120));
 
     // 换个进程：内存清空，只从文件恢复。
@@ -179,7 +179,7 @@ fn reporting_does_not_clear_the_ledger() {
     let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
     reset_ledger(None);
 
-    super::set_held_account(Some("acct-a".to_string()));
+    super::set_held_account(Some("acct-a".to_string()), None);
     super::record_turn_usage("s-1", "gpt-5", &turn(5));
 
     let first = super::pending_usage();

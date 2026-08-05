@@ -8,6 +8,7 @@ use codex_app_server_protocol::RateLimitReachedType;
 use codex_app_server_protocol::RateLimitResetCreditsSummary;
 use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RateLimitWindow;
+use crate::status::StatusAccountDisplay;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use pretty_assertions::assert_eq;
@@ -54,11 +55,21 @@ async fn deliver_rolling_rate_limit_snapshot(
     app_server: &AppServerSession,
     snapshot: RateLimitSnapshot,
 ) {
+    deliver_rolling_rate_limit_snapshot_for_account(app, app_server, snapshot, /*email*/ None).await;
+}
+
+async fn deliver_rolling_rate_limit_snapshot_for_account(
+    app: &mut App,
+    app_server: &AppServerSession,
+    snapshot: RateLimitSnapshot,
+    email: Option<String>,
+) {
     app.handle_app_server_event(
         app_server,
         codex_app_server_client::AppServerEvent::ServerNotification(
             ServerNotification::AccountRateLimitsUpdated(AccountRateLimitsUpdatedNotification {
                 rate_limits: snapshot,
+                account_email: email,
             }),
         ),
     )
@@ -98,6 +109,57 @@ fn deliver_usage_limit_error(app: &mut App) {
         }),
         /*replay_kind*/ None,
     );
+}
+
+/// `/status` 的账号行必须跟着派号走。
+///
+/// 凭据池每个请求派一个号，而百分比来自刚回来的那次响应。邮箱如果只在启动时取一次
+/// （原来就是这样），这一行就会拿第一个号的邮箱去配最后一个号的额度——两个数字属于
+/// 两个账号，谁也对不上服务端。
+#[tokio::test]
+async fn the_account_line_follows_whichever_account_served_the_request() -> Result<()> {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+        .await
+        .expect("embedded app server");
+
+    deliver_rolling_rate_limit_snapshot_for_account(
+        &mut app,
+        &app_server,
+        rate_limit_snapshot(/*used_percent*/ 12, None, None),
+        Some("first@example.com".to_string()),
+    )
+    .await;
+    assert!(matches!(
+        app.chat_widget.status_account_display(),
+        Some(StatusAccountDisplay::ChatGpt { email: Some(email), .. }) if email == "first@example.com"
+    ));
+
+    // 换号了，这一行必须跟着换，不能还挂着上一个号。
+    deliver_rolling_rate_limit_snapshot_for_account(
+        &mut app,
+        &app_server,
+        rate_limit_snapshot(/*used_percent*/ 59, None, None),
+        Some("second@example.com".to_string()),
+    )
+    .await;
+    assert!(matches!(
+        app.chat_widget.status_account_display(),
+        Some(StatusAccountDisplay::ChatGpt { email: Some(email), .. }) if email == "second@example.com"
+    ));
+
+    // 没带邮箱是"不知道"，不是"没有账号"——稀疏更新不能把已知的抹掉。
+    deliver_rolling_rate_limit_snapshot(
+        &mut app,
+        &app_server,
+        rate_limit_snapshot(/*used_percent*/ 61, None, None),
+    )
+    .await;
+    assert!(matches!(
+        app.chat_widget.status_account_display(),
+        Some(StatusAccountDisplay::ChatGpt { email: Some(email), .. }) if email == "second@example.com"
+    ));
+    Ok(())
 }
 
 #[tokio::test]

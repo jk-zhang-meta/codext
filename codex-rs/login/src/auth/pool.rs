@@ -191,6 +191,12 @@ struct Ledger {
     path: Option<PathBuf>,
     /// 此刻手上的号。`None` 表示没租到（退回本机 auth.json），那期间的用量不归池子。
     held: Option<String>,
+    /// 手上这个号的邮箱，给 `/status` 用。
+    ///
+    /// 存在这里而不是现问租约，是因为问租约的那条路（[`PoolAuth::current`]）在
+    /// 合并窗之外会**重新派号**——用它来读一眼「现在是哪个号」，会把号读成另一个。
+    /// 这个字段只写不问，读它永远不会改变任何东西。
+    held_email: Option<String>,
     /// 手上这个号刚被 OpenAI 以「配额用尽」拒了，等下一次派号时报上去。
     refused: bool,
     rows: Vec<LedgerRow>,
@@ -201,6 +207,7 @@ impl Ledger {
         Self {
             path: None,
             held: None,
+            held_email: None,
             refused: false,
             rows: Vec::new(),
         }
@@ -294,10 +301,20 @@ pub fn report_account_refused() {
     }
 }
 
-fn set_held_account(account_key: Option<String>) {
+fn set_held_account(account_key: Option<String>, email: Option<String>) {
     if let Ok(mut ledger) = LEDGER.lock() {
         ledger.held = account_key;
+        ledger.held_email = email;
     }
+}
+
+/// 此刻派出去的那个号的邮箱，`None` 表示没在用池子。
+///
+/// `/status` 那一行的邮箱和额度百分比必须说的是同一个号。百分比来自刚回来的那次
+/// 响应，所以邮箱也要在同一时刻取——每请求派号意味着「上一次是谁」和「下一次是谁」
+/// 通常不是同一个号，晚一步取到的就是另一个号的邮箱。
+pub fn held_account_email() -> Option<String> {
+    LEDGER.lock().ok().and_then(|ledger| ledger.held_email.clone())
 }
 
 /// 有没有一条还没送达服务端的拒绝。
@@ -624,7 +641,7 @@ impl PoolAuth {
     }
 
     fn store(&self, account_key: String, auth: CodexAuth) -> CodexAuth {
-        set_held_account(Some(account_key.clone()));
+        set_held_account(Some(account_key.clone()), auth.get_account_email());
         if let Ok(mut guard) = self.lease.write() {
             *guard = Some(Lease {
                 account_key,
@@ -652,7 +669,7 @@ impl PoolAuth {
     /// 留着的话下一个请求还会把它当作「我手上的号」报上去，连带把**退回本地之后**
     /// 跑掉的用量和额度读数记到它头上——那是调度赖以判断的读数，污染不得。
     fn forget_lease(&self) {
-        set_held_account(None);
+        set_held_account(None, None);
         if let Ok(mut guard) = self.lease.write() {
             *guard = None;
         }

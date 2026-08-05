@@ -842,6 +842,7 @@ mod tests {
                     plan_type: Some(PlanType::Plus),
                     rate_limit_reached_type: None,
                 },
+                account_email: None,
             });
 
         assert_eq!(
@@ -862,7 +863,8 @@ mod tests {
                         "spendControlReached": null,
                         "planType": "plus",
                         "rateLimitReachedType": null
-                    }
+                    },
+                    "accountEmail": null
                 },
             }),
             serde_json::to_value(notification)

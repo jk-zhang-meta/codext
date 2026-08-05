@@ -90,6 +90,11 @@ impl App {
                     self.rate_limit_hard_stop_generation =
                         self.rate_limit_hard_stop_generation.wrapping_add(1);
                 }
+                // 先换号再写读数，两者本来就是同一条消息里的，顺序只影响一次渲染。
+                self.chat_widget.set_status_account_from_rate_limits(
+                    notification.account_email.clone(),
+                    notification.rate_limits.plan_type,
+                );
                 self.chat_widget
                     .on_rolling_rate_limit_snapshot(notification.rate_limits.clone());
                 return;

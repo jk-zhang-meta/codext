@@ -186,6 +186,36 @@ impl ChatWidget {
         self.status_account_display.as_ref()
     }
 
+    /// Point the account line at whichever account produced the readings that
+    /// arrived with it.
+    ///
+    /// Deliberately not `update_account_state`: that one treats an account
+    /// change as an identity boundary and drops pending account-scoped requests
+    /// and rate-limit warning state. Under a credential pool the serving account
+    /// rotates every request, so running that on each turn would keep clearing
+    /// state the session still needs. Nothing here is account-scoped — it is the
+    /// one line `/status` prints — so this only swaps what is displayed.
+    ///
+    /// A `None` email leaves the line alone: the notification is a sparse
+    /// update, and unknown means unknown, not "no account".
+    pub(crate) fn set_status_account_from_rate_limits(
+        &mut self,
+        email: Option<String>,
+        plan_type: Option<PlanType>,
+    ) {
+        let Some(email) = email else { return };
+        let plan = plan_type
+            .map(crate::status::plan_type_display_name)
+            .or_else(|| match self.status_account_display.as_ref() {
+                Some(StatusAccountDisplay::ChatGpt { plan, .. }) => plan.clone(),
+                _ => None,
+            });
+        self.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+            email: Some(email),
+            plan,
+        });
+    }
+
     pub(crate) fn runtime_model_provider_base_url(&self) -> Option<&str> {
         self.runtime_model_provider_base_url.as_deref()
     }

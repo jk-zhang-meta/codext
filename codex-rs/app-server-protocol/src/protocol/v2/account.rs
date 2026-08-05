@@ -517,6 +517,20 @@ pub struct AccountUpdatedNotification {
 /// does not clear a previously observed value.
 pub struct AccountRateLimitsUpdatedNotification {
     pub rate_limits: RateLimitSnapshot,
+    /// The account these readings belong to, when it is knowable.
+    ///
+    /// With a credential pool the serving account can differ from one request to
+    /// the next, so an email read at any other moment describes a different
+    /// account than the percentages above. Carrying it here is what keeps the
+    /// two from disagreeing: they arrive together or not at all.
+    ///
+    /// `None` means unknown — per this notification's sparse-update contract it
+    /// leaves a previously observed value alone rather than clearing it.
+    ///
+    /// Plain `Option`, no `skip_serializing_if`: outside `*Params` types this
+    /// schema forbids a field that is both optional and nullable, and
+    /// `generated_ts_optional_nullable_fields_only_in_params` enforces it.
+    pub account_email: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

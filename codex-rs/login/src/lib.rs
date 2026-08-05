@@ -53,6 +53,7 @@ pub use auth::login_with_bedrock_api_key;
 pub use auth::logout;
 pub use auth::logout_with_revoke;
 pub use auth::oauth_client_id;
+pub use auth::held_account_email;
 pub use auth::pool_is_exhausted;
 pub use auth::record_turn_usage;
 pub use auth::report_account_refused;
