@@ -37,7 +37,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::handle_retryable_response_stream_error;
-use crate::responses_retry::ends_the_turn;
+use crate::responses_retry::ends_the_turn_now;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -1401,7 +1401,10 @@ async fn run_sampling_request(
         // 问的是另一个问题：**这一轮该不该结束**。答案只在用户自己叫停、以及上下文/
         // 预算这种一轮之内改不了的硬边界时才是"该"。其余全部落进重试循环，报一次，
         // 然后等着：能修的用户去修，修不了的用户按 Esc。判断在 `responses_retry`。
-        if ends_the_turn(&err) {
+        //
+        // 例外是调用方自己设过 `stream_max_retries`——那时上游那句就地退出也要一并
+        // 还回去，否则不可重试的错误仍会在上限之内白打一趟。见 `ends_the_turn_now`。
+        if ends_the_turn_now(&err, turn_context.as_ref()) {
             return Err(err);
         }
 

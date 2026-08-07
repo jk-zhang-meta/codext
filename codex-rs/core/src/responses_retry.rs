@@ -46,6 +46,39 @@ pub(crate) fn ends_the_turn(err: &CodexErr) -> bool {
     )
 }
 
+/// codext: 这一轮到此为止吗——采样循环真正问的那个问题。
+///
+/// [`ends_the_turn`] 那五个永远成立。这里多一条：宿主自己设过 `stream_max_retries`
+/// 时，"设过 = 一字不差回到上游"这条承诺必须**包括上游那句 `!err.is_retryable()`
+/// 的就地退出**。只在 [`retry_is_allowed`] 里认这个开关是不够的——不可重试的错误
+/// 照样会先落进重试循环，在上限之内白打一趟，而那一趟对调用方是可见的。
+///
+/// 0.147.0 的 guardian 复核就是被这一趟打中的：它给自己的子会话设了
+/// `stream_max_retries = Some(1)`，然后**自己**按 `max_attempts` 重试、把底层错误
+/// 写进拒绝理由。我们多打的那一趟既吃掉了它的 attempt 计数，也吃掉了它 mock 序列
+/// 里的下一个响应，于是"重试一次就通过"变成"一次就通过"，"把 responses API 的错误
+/// 报给用户"变成报了一个对不上的错误。
+///
+/// 这不是给 guardian 开的特例：任何一个把自己的重试策略写在外面、并且用这个配置项
+/// 表达过"我自己管"的调用方，都该拿到上游那套行为。
+///
+/// 账号级失败和池子枯竭仍然不受这个开关约束——那两件事是这套东西存在的理由。
+///
+/// 连带的一条教训：`is_retryable()` 是**全仓共用的分类**，guardian、远端压缩、传输
+/// 回退、app-server 都读它。我们一度把 `ServerOverloaded` 在那里翻成"可重试"来表达
+/// "服务器忙就等着，别掐会话"——那是把**我们的策略**写进了**别人的分类**，0.147.0
+/// 的 guardian 一上来就被它绊倒。策略留在这个模块里就够了：无限重试那条路根本不问
+/// `is_retryable()`，它问的是 [`ends_the_turn`]。
+pub(crate) fn ends_the_turn_now(err: &CodexErr, turn_context: &TurnContext) -> bool {
+    if ends_the_turn(err) {
+        return true;
+    }
+    honors_ceiling(turn_context)
+        && !err.is_retryable()
+        && !is_account_scoped(err)
+        && !codex_login::pool_is_exhausted()
+}
+
 /// Handles a retryable stream error and returns `Ok(())` when the caller should
 /// retry the request loop.
 pub(crate) async fn handle_retryable_response_stream_error(
@@ -61,7 +94,11 @@ pub(crate) async fn handle_retryable_response_stream_error(
     // `turn.rs` 会先把不可重试的错误挡在外面，所以这里看到的必然是传输类故障。现在
     // 它们会走到这儿，而"模型不支持图片输入"这种拒绝换条通道重发还是同样被拒——白
     // 打一趟不说，本该直接报给用户的错误会变成一次无声的重试。
-    if err.is_retryable()
+    //
+    // `ServerOverloaded` 要单列：上游把它归为不可重试（我们不再去改那个共用分类，
+    // 见 `ends_the_turn_now`），但对"这条通道换一条试试"来说它是值得试的——一个
+    // 只在 websocket 上挤爆的后端，回退到 HTTPS 确实可能通。
+    if (err.is_retryable() || matches!(err.details(), CodexErrorDetails::ServerOverloaded))
         && *retries >= max_retries
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,
