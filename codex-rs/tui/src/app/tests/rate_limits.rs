@@ -66,12 +66,12 @@ async fn deliver_rolling_rate_limit_snapshot_for_account(
 ) {
     app.handle_app_server_event(
         app_server,
-        codex_app_server_client::AppServerEvent::ServerNotification(
+        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
             ServerNotification::AccountRateLimitsUpdated(AccountRateLimitsUpdatedNotification {
                 rate_limits: snapshot,
                 account_email: email,
             }),
-        ),
+        )),
     )
     .await;
 }
