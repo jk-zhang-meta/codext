@@ -60,6 +60,9 @@ fn turn(total: i64) -> codex_protocol::protocol::TokenUsage {
         output_tokens: 0,
         reasoning_output_tokens: 0,
         total_tokens: total,
+        // 上游 0.147.0 新加的字段：厂商报的 rollout 预算消耗。账本只按 token 数
+        // 和归属记账，跟它无关。
+        codex_rollout_budget_units: None,
     }
 }
 
