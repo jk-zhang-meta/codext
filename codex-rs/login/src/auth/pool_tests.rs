@@ -325,6 +325,63 @@ async fn the_auth_manager_serves_pool_credentials_with_no_auth_json_on_disk() {
     assert_eq!(auth.get_account_id().as_deref(), Some("acct-pool"));
 }
 
+/// 上面那个测试盯的是 `shared()`，而 `codex` 一个真实入口都不走 `shared()`。
+///
+/// 这条盯的是真正被走的那条路。0.147.0 上游在 `shared_from_config` 和 `shared()`
+/// 之间插了 `shared_from_auth_config`，`shared()` 本身一个字没动——合并没有冲突，
+/// 代码照编，上面那个测试照过，而池子在 `cli/main.rs`、`app-server/in_process.rs`
+/// 和 TUI 里全部静默失效，codext 每次退回本机 auth.json。用户看到的是"启动起来
+/// 跟原生 codex 一模一样"，因为那时候它确实就是。
+///
+/// 所以这条测试的意义不在于多测一个构造函数，而在于：**挂钩点的正确性只能由走
+/// 真实入口的测试来保证，不能由"这个函数近几版没被改过"来保证。** 上游改的从来
+/// 不必是我们挂的那个函数，改调用图就够了。
+#[tokio::test]
+async fn the_pool_is_installed_on_the_path_the_cli_actually_takes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-a")))
+        .mount(&server)
+        .await;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        home.path().join("pool.json"),
+        serde_json::json!({"base_url": server.uri(), "key": "test-key"}).to_string(),
+    )
+    .expect("write config");
+    assert!(!home.path().join("auth.json").exists());
+
+    // `AuthManager::shared_from_config` 只是把 `Config` 拆成 `AuthConfig` 再调这个；
+    // `login` 不能依赖 `core`（会成环），所以在这一层能测到的汇合点就是它。
+    let manager = crate::auth::AuthManager::shared_from_auth_config(
+        crate::auth::AuthConfig {
+            codex_home: home.path().to_path_buf(),
+            auth_credentials_store_mode: crate::AuthCredentialsStoreMode::File,
+            keyring_backend_kind: crate::auth::AuthKeyringBackendKind::default(),
+            forced_login_method: None,
+            chatgpt_base_url: None,
+            forced_chatgpt_workspace_id: None,
+            managed_auth_policy: Default::default(),
+            auth_route_config: crate::test_support::transport_default_auth_route_config(),
+        },
+        /*enable_codex_api_key_env*/ false,
+    )
+    .await;
+
+    assert!(
+        manager.has_external_auth(),
+        "pool provider must be installed on the shared_from_config path too — \
+         that is the one every codex entry point uses"
+    );
+    let auth = manager
+        .auth()
+        .await
+        .expect("credentials must come from the pool");
+    assert_eq!(auth.get_account_id().as_deref(), Some("acct-pool"));
+}
+
 /// 一次模型调用周围的连锁取凭据只打一个往返。
 ///
 /// 上游的 `auth()` 在外部 provider 模式下每次都 `reload()`，围绕一次调用会被调

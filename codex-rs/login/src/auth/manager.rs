@@ -2595,7 +2595,23 @@ impl AuthManager {
         auth_config: AuthConfig,
         enable_codex_api_key_env: bool,
     ) -> Arc<Self> {
-        Arc::new(Self::new_from_auth_config(auth_config, enable_codex_api_key_env).await)
+        // codext: 池子要装在**每一条**产出 `Arc<AuthManager>` 的路上，不是某一条。
+        //
+        // 0.146.0 里 `shared_from_config` 直接调 `shared()`，所以只挂那一处就够。
+        // 0.147.0 上游在中间插了这一层，`shared_from_config` 改道到这里——`shared()`
+        // 本身一个字没动，合并没有冲突，代码照编，而挂钩变成了死代码：`codex` 的
+        // 每一个真实入口（cli/main.rs、app-server/in_process.rs、TUI）走的都是
+        // `shared_from_config`，于是池子永不安装，每次都静默退回本机 auth.json——
+        // 表现是"codext 跑起来跟原生一模一样"。
+        //
+        // 教训：按函数级 churn 挑挂钩点，挑得中"这个函数会不会被改"，挑不中"谁还
+        // 会调用它"。挂钩必须钉在**汇合点**上，并且由一条走真实入口的测试盯着，
+        // 见 `pool_tests.rs` 的 `test_the_pool_is_installed_on_every_shared_path`。
+        let codex_home = auth_config.codex_home.clone();
+        let manager =
+            Arc::new(Self::new_from_auth_config(auth_config, enable_codex_api_key_env).await);
+        super::pool::install_if_configured(&manager, &codex_home).await;
+        manager
     }
 
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {

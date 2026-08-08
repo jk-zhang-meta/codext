@@ -297,8 +297,69 @@ git fetch upstream --tags
 git merge rust-v0.<下一个版本>.0        # 基线是 tag，不是 main
 ```
 
-冲突面应当只有 `shared()` 那几行。如果冲突扩散到别处，说明有改动溢出了
-`pool.rs` 的边界，需要收回去。
+**发版 tag 之间互相不是祖先。** 上游从 release 分支切 tag，所以上一个 tag 不是下一个
+的祖先，合并基点比上一个 tag 还老。workspace `Cargo.toml` 的版本号那行必然冲突（取
+上游的）。判据不是"冲突多不多"，是：
+
+```
+git diff --cached <新tag>        # 合并结果 vs 纯上游
+```
+
+它应当与合并前 `git diff <旧tag> HEAD` 的统计**逐字节相同**。相同 = 既没有上游改动被
+盖掉，也没有我们的改动被冲掉。
+
+### 真正的危险是零冲突的那一类
+
+**git 报的冲突不是风险，自动合并成功的才是。** 2026-08-08 合 0.147.0，文本冲突只有
+版本号一行，344 个提交全部自动合并——然后有三处坏掉，两处编不过或跑不对，一处**编
+得过、跑得通、静默失效**：
+
+1. **`TokenUsage` 加了字段** → `pool_tests.rs` 里整体构造它的 fixture 编不过。编译器
+   会告诉你，最轻的一类。
+
+2. **上游新代码读了我们改过的共用分类。** 我们曾把 `ServerOverloaded` 在
+   `protocol/src/error.rs` 的 `is_retryable()` 里翻成"可重试"来表达"服务器忙就等"。
+   那是把**我们的策略**写进了**全仓共用的分类**——guardian、远端压缩、传输回退、
+   app-server 都读它。0.147.0 新增的 guardian 一上来就被绊倒。
+   **规则：策略留在 `responses_retry.rs`，不要动 `is_retryable()`。**
+
+3. **挂钩点被"调用图"抛下（最贵的一次，用户先发现的）。** 0.146.0 里
+   `shared_from_config` 直接调 `shared()`，我们的 `install_if_configured` 挂在
+   `shared()` 上就够。0.147.0 上游在中间插了一层：
+
+   ```
+   0.146.0  shared_from_config ──────────────────────► shared() ──► 装 provider ✅
+   0.147.0  shared_from_config ──► shared_from_auth_config ──► new_from_auth_config ❌
+                                                        （shared() 一个字没改，成了死代码）
+   ```
+
+   上游**没动 `shared()`**，动的是**谁调用它**。于是：无冲突、能编译、
+   `pool_tests.rs` 全绿（因为它直接调 `shared()`，测的正是那条没人走的路），而
+   `codex` 的每一个真实入口（`cli/src/main.rs`、`app-server/src/in_process.rs`、TUI）
+   走的都是 `shared_from_config`——**池子永不安装，每次静默退回本机 `auth.json`**。
+   表现极具迷惑性：codext 跑起来"跟原生一模一样"，有 `auth.json` 的机器显示旧账号，
+   没有的机器让你登录。任何自动化都不会报错。
+
+   **`shared()` 的函数级 churn 确实是 0。churn 分析看不见调用图的变化。**
+
+### 因此每次合并必须做的三件事
+
+1. **跑那条走真实入口的测试**：`pool_tests.rs` 的
+   `the_pool_is_installed_on_the_path_the_cli_actually_takes`。它走
+   `shared_from_auth_config`（`shared_from_config` 的汇合点，`login` 不能依赖 `core`
+   所以只能测到这一层）。**新加挂钩点时，配套的测试必须走真实入口，不能走挂钩点本身。**
+2. **核对调用图，不只核对挂钩函数**：
+   ```
+   grep -rn --include='*.rs' "AuthManager::shared" . | grep -v test
+   ```
+   出现任何我们没挂过的 `Arc<AuthManager>` 产出路径，就是又一次同样的坑。
+3. **做基线对照再下结论**（见"测试"一节）：这个环境下纯上游本来就有 ~42 个失败，
+   不对照就分不清哪些是自己弄坏的。
+
+### 挂钩点原则
+
+挂在**汇合点**上，不是挂在"最近没被改过的函数"上。判据是"这条路绕不过去吗"，
+不是"这个函数会不会被改"。绕得过去的，就一定有一天会被绕过去。
 
 ## 构建
 
