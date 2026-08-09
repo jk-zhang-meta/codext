@@ -460,6 +460,16 @@ pub(crate) fn is_account_scoped(err: &CodexErr) -> bool {
 ///
 /// 只影响措辞，不影响要不要重试。分出来是因为这两句话对用户的意义完全不同：
 /// "网断了，在等它回来" 让人去泡杯茶，"这个错不会自己好" 让人去看配置。
+/// ⚠️ **这张表和 [`is_account_scoped`] 有意重叠，优先级由 [`RetryKind::of`] 决定。**
+///
+/// `QuotaExceeded` / `UsageNotIncluded` 同时满足两边：有池子时账号级分支先命中，走
+/// `SwapAccount`；没池子时才落到这里说"去把账单修好"。这是对的——同一个错误在两种
+/// 部署下确实是两回事。改任一边之前先看 `RetryKind::of` 的分支顺序，别以为它们互斥。
+///
+/// 另一处不一致同样是有意的：`Json` / `TokioJoin` / `InternalAgentDied` 在上游的
+/// `is_retryable()` 里是 true，在这里是 true（"不会自己好"）。只影响措辞，不影响要不要
+/// 重试——除非用户设过 `stream_max_retries`，那时 `ends_the_turn_now` 读的是
+/// `is_retryable()`，两条路会给出不同结论。这是"设过就一字不差回到上游"的代价。
 fn will_not_fix_itself(err: &CodexErr, trust_status_codes: bool) -> bool {
     match err.details() {
         CodexErrorDetails::Json(_)

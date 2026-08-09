@@ -279,16 +279,25 @@ impl RequestUserInputOverlay {
         }
     }
 
+    /// codext: 交互推迟自动放行，**不再永久取消它**。
+    ///
+    /// 上游这里把 `auto_resolution_snoozed` 一旦置位就再也不复位（只有换到下一个
+    /// request 才清），后果是：你在这个提问上随手按一下键或粘贴一次，那 120 秒的
+    /// 自动放行就**永远**不会到点了——从此这一轮停在这里等人，而这正是"跑到一半
+    /// 被打断"里最难查的一种，因为它看起来像是你自己选择了不回答。
+    ///
+    /// 推迟的语义才是这个交互本来的意思："他正在打字，别抢答"。所以重置计时起点：
+    /// 每动一次键盘倒计时重来，手停下来满两分钟照样自动放行。
     fn snooze_auto_resolution(&mut self) {
         if !self.request.is_blocking {
-            self.auto_resolution_snoozed = true;
+            self.request_started_at = Instant::now();
         }
     }
 
     fn auto_resolution_timing_at(&self, now: Instant) -> AutoResolutionTiming {
         // autoResolutionMs is deprecated; isBlocking now controls whether the
         // request can auto-resolve using the TUI's fixed grace/countdown policy.
-        if self.request.is_blocking || self.auto_resolution_snoozed {
+        if self.request.is_blocking {
             return AutoResolutionTiming::Disabled;
         }
 
@@ -1998,7 +2007,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_resolution_key_interaction_snoozes_timer() {
+    fn auto_resolution_key_interaction_postpones_timer() {
         let (tx, mut rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
             request_event_with_auto_resolution(
@@ -2016,16 +2025,23 @@ mod tests {
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Down));
 
-        assert_eq!(
+        // codext: 计时从交互那一刻重来，所以原本该到点的时刻还没到点……
+        assert_ne!(
             overlay.auto_resolution_timing_at(now + total_timeout),
-            AutoResolutionTiming::Disabled
+            AutoResolutionTiming::Due
         );
         assert!(!overlay.pre_draw_tick(now + total_timeout));
         assert!(rx.try_recv().is_err());
+        // ……但它没有被取消：手停下来满一个完整周期照样到点。上游那版做不到这一条，
+        // 一次按键就让自动放行永远不到点，于是这一轮停在这里等人。
+        assert_eq!(
+            overlay.auto_resolution_timing_at(now + total_timeout * 2),
+            AutoResolutionTiming::Due
+        );
     }
 
     #[test]
-    fn auto_resolution_paste_interaction_snoozes_timer() {
+    fn auto_resolution_paste_interaction_postpones_timer() {
         let (tx, mut rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
             request_event_with_auto_resolution(
@@ -2043,12 +2059,19 @@ mod tests {
 
         assert!(overlay.handle_paste("notes".to_string()));
 
-        assert_eq!(
+        // codext: 计时从交互那一刻重来，所以原本该到点的时刻还没到点……
+        assert_ne!(
             overlay.auto_resolution_timing_at(now + total_timeout),
-            AutoResolutionTiming::Disabled
+            AutoResolutionTiming::Due
         );
         assert!(!overlay.pre_draw_tick(now + total_timeout));
         assert!(rx.try_recv().is_err());
+        // ……但它没有被取消：手停下来满一个完整周期照样到点。上游那版做不到这一条，
+        // 一次按键就让自动放行永远不到点，于是这一轮停在这里等人。
+        assert_eq!(
+            overlay.auto_resolution_timing_at(now + total_timeout * 2),
+            AutoResolutionTiming::Due
+        );
     }
 
     #[test]
