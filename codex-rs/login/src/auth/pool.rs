@@ -374,6 +374,16 @@ pub(super) async fn install_if_configured(manager: &Arc<AuthManager>, codex_home
     // 用户至少还能用自己 `codex login` 登过的号。
     if let Err(err) = manager.set_external_auth(pool.clone()).await {
         tracing::warn!("codext: pool auth unavailable, keeping local auth: {err}");
+        // **把枯竭标记清掉再走。** 启动这一次如果拿到的是 `data: null`，
+        // `current()` 已经先 `mark_pool_exhausted()` 了；而清掉它的
+        // `mark_pool_serving()` 只在成功派号时调用——此刻 provider 没装上、心跳也没
+        // 起，三条能到达 `current()` 的路全断，这个标记就再也清不掉了。
+        //
+        // 后果是进程级的，而且看起来完全不像这个原因：`pool_is_exhausted()` 会让
+        // `ends_the_turn_now` 对一切错误恒为 false、`retry_is_allowed` 恒为 true、
+        // `RetryKind::of` 恒返回 `PoolExhausted`。于是一个"模型名写错"的 404 会变成
+        // 30 秒一次、永不结束的重试，界面上还写着"去后台加一个账号"。
+        mark_pool_serving();
         return;
     }
     spawn_idle_tick(pool);
@@ -565,7 +575,12 @@ impl PoolAuth {
                 self.abandon_current().await?;
                 Err(std::io::Error::other("no account available in the pool"))
             }
-            Err(err) if allow_stale => match self.cached_auth() {
+            // 连不上时可以继续骑手上那份——几十毫秒的抖动不该打断会话。**但有一个
+            // 例外：手上这份刚被对面拒过。** 上面那个合并窗已经判了 `refused`，这里
+            // 漏判的话就成了 6 秒一圈的死循环：撞 429 → 标记 refused → 重试 → post
+            // 失败 → 原样拿回同一个号 → 再撞 429。宁可退回本机 auth.json，那至少是
+            // 一个没被拒过的凭据。
+            Err(err) if allow_stale && !refused => match self.cached_auth() {
                 Some(auth) => {
                     tracing::warn!("codext: pool unreachable, reusing the current lease: {err}");
                     Ok(auth)

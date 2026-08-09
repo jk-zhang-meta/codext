@@ -19,30 +19,42 @@ pub(crate) enum ResponsesStreamRequest {
     RemoteCompactionV2,
 }
 
-/// codext: 采样路径上仍然终结这一轮的全部错误。
+/// codext: 采样路径上仍然终结这一轮的错误——**只剩用户自己按下的暂停**。
 ///
-/// 注意这里**没有**"重试没用所以我们放弃"这一类——那个判断已经不归我们做了。
-/// 剩下的四个各有各的理由：
+/// 注意这里**没有**"重试没用所以我们放弃"这一类：那个判断不归我们做。
 ///
-/// - `TurnAborted` / `Interrupted` 就是用户按下的暂停。重试它们等于让 Esc 失灵，
-///   而"用户随时可以自己叫停"正是无限重试能成立的前提——把这个出口堵上，剩下的
-///   设计全部变成挂死。
-/// - `ContextWindowExceeded` 由上面那个专门的分支处理：它要先记满 token 数才能
-///   触发压缩。同一个超长请求重试一万次还是装不下，而用户在一轮**之内**没有任何
-///   办法把它变短。
-/// - `SessionBudgetExceeded` 是用户自己设的开销上限。绕过它重试等于把这个设置
-///   悄悄作废。
-/// - `CyberPolicy` 是服务端的安全策略拒绝。它跟别的错误不是一回事：那些是**故障**，
-///   这个是**答复**。把一个安全判定塞进无限循环里反复问，既问不出别的结果，性质上
-///   也不该由客户端自动去做。
+/// `TurnAborted` / `Interrupted` 就是 Esc。重试它们等于让 Esc 失灵，而"用户随时
+/// 可以自己叫停"正是整套无限重试能成立的前提——把这个出口堵上，剩下的设计全部
+/// 变成挂死。
+///
+/// 2026-08-09 一次性拿掉了另外三个，理由都是同一条：**它们各自的"重试没用"论据
+/// 在真实使用里都不成立，而误判的代价是掐断一轮跑到一半的会话。**
+///
+/// - `CyberPolicy`：原论据是"安全判定是答复不是故障，重试问不出别的结果"。前提是
+///   这个判定确定性成立——实际不是，这个分类器误判很常见，同样内容重发经常就过。
+///   现归 [`RetryKind::CyberFlag`]，措辞同时给出"可能是误判"和"改写请求也能解"。
+/// - `ContextWindowExceeded`：原论据是"重试一万次还是装不下"。前提是中间不压缩。
+///   现在先当场压缩再继续，压完就装得下了。
+/// - `SessionBudgetExceeded`：用户自己设的开销上限。这一个拿掉是有代价的——等于
+///   让那个配置失效，见函数体里的注释。
 pub(crate) fn ends_the_turn(err: &CodexErr) -> bool {
     matches!(
         err.details(),
-        CodexErrorDetails::TurnAborted
-            | CodexErrorDetails::Interrupted
-            | CodexErrorDetails::ContextWindowExceeded
-            | CodexErrorDetails::SessionBudgetExceeded
-            | CodexErrorDetails::CyberPolicy { .. }
+        CodexErrorDetails::TurnAborted | CodexErrorDetails::Interrupted
+        // 2026-08-09：只剩用户自己按下的暂停。下面两个刻意保留成注释而不是删掉，
+        // 因为它们各自有过成立的理由，恢复时把行取消注释即可。
+        //
+        // | CodexErrorDetails::ContextWindowExceeded
+        //     上下文装不下。原来的理由是"同一个超长请求重试一万次还是装不下"——
+        //     那句话的前提是中间不压缩。现在 `turn.rs` 的专门分支会先当场压缩再继续
+        //     （见 `codext_compaction::compact_and_continue`），压完就装得下了，所以
+        //     这里不该再终结。注意：光把这一行注释掉是不够的，那个分支更早就
+        //     `return Err`，走不到这里。
+        //
+        // | CodexErrorDetails::SessionBudgetExceeded
+        //     用户自己设的开销上限。无限重试等于把这个设置悄悄作废——**这是这张表里
+        //     唯一一个"拿掉它就等于让用户的配置失效"的项**。当前按"除了 Esc 都别停"
+        //     的口径拿掉了；哪天想让 `/goal` 的预算重新硬起来，恢复这一行即可。
     )
 }
 
@@ -223,6 +235,17 @@ enum RetryKind {
     /// 同样的请求会以同样的方式失败：模型名写错的 404、代理返回的 HTML、欠费。
     /// 照样重试——但话要说成"它不会自己好"，否则用户不知道该去修什么。
     Stuck,
+    /// 手上这份租来的凭据被拒（续期失败）。池子已经在 `ExternalAuth::refresh` 里
+    /// 带 `reject=unauthorized` 换过号了，服务端自动换——这里不重复上报，只把话
+    /// 说对：归 `Transient` 会说"网络失败，等它自己恢复"，两句都是假的，会把人
+    /// 支去查网络；归 `SwapAccount` 又会说"这个号额度用尽"，也不对。
+    CredentialRejected,
+    /// 服务端的网络安全策略拒绝了这次请求的内容。
+    ///
+    /// 单独一档而不是并进 `Stuck`：那一档的措辞是"去修配置"，而这里没有配置可修；
+    /// 也不是 `Transient`，那一档说"网络失败"，同样把人指错方向。这个分类器误判
+    /// 很常见，同样内容重发经常就过——所以照常重试，同时告诉用户改写请求也能解。
+    CyberFlag,
 }
 
 impl RetryKind {
@@ -247,6 +270,12 @@ impl RetryKind {
         let trust_status_codes = !sess.services.model_client.responses_websocket_enabled();
         match err.details() {
             CodexErrorDetails::ServerOverloaded => Self::Capacity,
+            // 池子供号时凭据被拒 = 换号，不是网络故障。没有池子时它确实"不会自己
+            // 好"（本机 refresh token 死了要重新登录），交给下面的 `Stuck`。
+            CodexErrorDetails::RefreshTokenFailed(_) if leases_credentials(turn_context) => {
+                Self::CredentialRejected
+            }
+            CodexErrorDetails::CyberPolicy { .. } => Self::CyberFlag,
             _ if will_not_fix_itself(err, trust_status_codes) => Self::Stuck,
             _ => Self::Transient,
         }
@@ -257,7 +286,9 @@ impl RetryKind {
             // 在等**人**去后台加号，不是等网络恢复，问得密没有意义；但也不能太稀，
             // 加完号总得让会话尽快接上。服务端给的任何延迟在这里都不相关。
             Self::PoolExhausted => POOL_EXHAUSTED_RETRY_DELAY,
-            Self::SwapAccount => base.clamp(ACCOUNT_SWAP_MIN_DELAY, MAX_RETRY_DELAY),
+            Self::SwapAccount | Self::CredentialRejected => {
+                base.clamp(ACCOUNT_SWAP_MIN_DELAY, MAX_RETRY_DELAY)
+            }
             // 窗口重置是小时到天的尺度。按剩余时间睡，但封顶——`resets_at` 可能偏，
             // 也可能有人在别处把额度让出来，睡满六天就再也醒不过来了。
             Self::QuotaWindow { resets_in } => resets_in
@@ -265,7 +296,7 @@ impl RetryKind {
                 .clamp(QUOTA_WINDOW_MIN_DELAY, QUOTA_WINDOW_MAX_DELAY),
             // 不会自己好的错误没必要按毫秒级退避去刷——用户得有时间读那条提示、
             // 去改配置。直接进慢档。
-            Self::Stuck => base.clamp(UNBOUNDED_RETRY_MIN_DELAY, MAX_RETRY_DELAY),
+            Self::Stuck | Self::CyberFlag => base.clamp(UNBOUNDED_RETRY_MIN_DELAY, MAX_RETRY_DELAY),
             // 前几次保持上游那条曲线（200ms 起步能很快救回一次抖动），超出上限之后
             // 才加下限——否则 `stream_max_retries = 0` 会变成每秒五次的热循环。
             Self::Capacity | Self::Transient => {
@@ -329,6 +360,15 @@ impl RetryKind {
                             its own. Retrying indefinitely so you can fix the cause without \
                             losing the session; press Esc to stop."
                 .to_string(),
+            Self::CredentialRejected => "The leased credential was rejected. The pool is \
+                                        handing this session another account automatically; \
+                                        retrying indefinitely. Press Esc to stop."
+                .to_string(),
+            Self::CyberFlag => "The service flagged this request as a possible cybersecurity \
+                                risk. That classifier misfires often, so this retries \
+                                indefinitely; rephrasing or splitting the request also clears \
+                                it. Press Esc to stop."
+                .to_string(),
         }
     }
 
@@ -347,6 +387,8 @@ impl RetryKind {
             Self::QuotaWindow { .. } => "account is out of quota and there is no pool to swap to",
             Self::Capacity => "selected model is at capacity",
             Self::Stuck => "request will not recover on its own",
+            Self::CredentialRejected => "leased credential was rejected - the pool is swapping accounts",
+            Self::CyberFlag => "request was flagged by the cybersecurity policy",
             // 瞬时故障沿用上游那条日志：它带着 retries/max_retries，是排查抖动时最有用的形状。
             Self::Transient => {
                 return log_retry(request, turn_context, err, retries, max_retries, delay);
@@ -363,12 +405,55 @@ impl RetryKind {
 
 /// 账号级失败：换一个还有余量的号就能继续，在同一个号上等没有意义。
 ///
-/// **只有 `UsageLimitReached`。** `QuotaExceeded` 看着像同类，其实是计费状态
-/// （"Quota exceeded. Check your plan and billing details."）：它不随额度窗口重置
-/// 恢复，也不携带额度读数，换号救不了它——它属于 [`RetryKind::Stuck`]，重试照旧，
-/// 但要告诉用户去把账单修好。
+/// `UsageLimitReached` 永远算。`QuotaExceeded`（"Quota exceeded. Check your plan
+/// and billing details."）**只在池子供号时**算。
+///
+/// 这一条原来写的是"换号救不了它，它属于 `Stuck`"——那是**单账号时代的判断**：一个
+/// 号的计费状态确实不会因为等待而恢复。但池子里另一个号有它自己的额度和账单，
+/// "换号"恰恰就是解。判据用 [`leases_credentials`] 而不是"有没有配过池子"：真正决定
+/// 这件事的是此刻这次请求的凭据是不是租来的。
+///
+/// 不算账号级的后果远不止"少换一次号"，有两层，第二层才是真正致命的：
+///
+/// 1. [`RetryKind::of`] 里**只有账号级分支**会 `report_account_refused()`。不报，
+///    服务端就要等后台观测（最快 30 秒）才知道这个号废了，这期间它会一次次把同一个
+///    跑满的号发回给正在重试的会话——于是重试在做无用功，看起来像"卡住不动"。
+/// 2. 远端压缩那条路更早就断了：`compact_remote_v2.rs` 里
+///    `Err(err) if !err.is_retryable() => return Err(err)` 挡在
+///    `handle_retryable_response_stream_error` 之前，而 `is_retryable()` 对这一族
+///    全是 false。所以 [`retry_is_allowed`] 里给压缩路径写的账号级放行**是死代码**，
+///    这条错误连重试循环都进不去，压缩当场失败。上下文满了又压不动，整轮就走不
+///    下去——用户看到的是 "Error running remote compact task: You've hit your usage
+///    limit…"，而手上明明还有二十几个号可用。兜底和上报补在 `turn.rs` 的
+///    `run_auto_compact` 里。
 pub(crate) fn is_account_scoped(err: &CodexErr) -> bool {
-    matches!(err.details(), CodexErrorDetails::UsageLimitReached(_))
+    match err.details() {
+        CodexErrorDetails::UsageLimitReached(_) => true,
+        // `QuotaExceeded`（计费/额度用尽）和 `UsageNotIncluded`（套餐不含这项用量）
+        // 与 `UsageLimitReached` 是同一族——**这不是我们的分类，是上游的**：
+        // `error.rs` 里这三个一起映射成 `CodexErrorInfo::UsageLimitExceeded`。
+        // 三个都是"这个号不行"，而池子里另一个号有它自己的额度、账单和套餐。
+        //
+        // 判据是"池子**此刻**有没有在供号"，不是"配没配过池子"：退回本机 auth.json
+        // 之后手上那个号是用户自己的，那时确实换无可换，仍归 `Stuck`。
+        CodexErrorDetails::QuotaExceeded | CodexErrorDetails::UsageNotIncluded => {
+            codex_login::held_account_email().is_some()
+        }
+        // 真正的 429 也是账号级的，只是它藏在一个兜底桶里。
+        //
+        // `codex-api/src/api_bridge.rs` 对 HTTP 429 先试 `usage_limit_reached` 和
+        // `usage_not_included`，**两者都不匹配的 429 一律落到 `RetryLimit`**。而 429
+        // 说的是"这个 org/账号此刻的速率桶满了"（服务端样本报文写的是 "Rate limit
+        // reached for … in organization org-… on tokens per min"），池子里另一个号有
+        // 它自己的桶，换号立刻就通。
+        //
+        // 用状态码区分而不是直接认变体：传输层自己重试耗尽也复用 `RetryLimit`，那种
+        // 是瞬时故障、和账号无关，它伪造的状态码是 500。
+        CodexErrorDetails::RetryLimit(_) if err.http_status_code_value() == Some(429) => {
+            codex_login::held_account_email().is_some()
+        }
+        _ => false,
+    }
 }
 
 /// 同一个请求会以完全相同的方式失败，除非**外面**有人改点什么。

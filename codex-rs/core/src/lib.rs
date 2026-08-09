@@ -8,6 +8,8 @@
 mod apply_patch;
 mod apps;
 mod client;
+// codext：压缩失败之后的恢复，上游没有对应物。
+mod codext_compaction;
 mod client_common;
 mod realtime_context;
 mod realtime_conversation;

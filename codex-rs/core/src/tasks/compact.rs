@@ -9,7 +9,6 @@ use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_features::Feature;
 use codex_model_provider::RemoteCompactionSupport;
-use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +37,8 @@ impl SessionTask for CompactTask {
             return Ok(None);
         }
 
+        // codext: 远端失败时要用它退回本地，所以先留一份。
+        let recovery_ctx = Arc::clone(&ctx);
         let result = match ctx.provider.capabilities().remote_compaction {
             RemoteCompactionSupport::V2
                 if ctx.config.features.enabled(Feature::RemoteCompactionV2) =>
@@ -76,10 +77,11 @@ impl SessionTask for CompactTask {
                 crate::compact::run_compact_task(session.clone(), ctx, input).await
             }
         };
-        if let Err(err) = result
-            && matches!(err.details(), CodexErrorDetails::TurnAborted)
-        {
-            return Err(err);
+        // codext: 远端 `/compact` 失败要退回本地并一直试到成功，见 `codext_compaction`。
+        // 上游在这里把错误吞掉就算完，但上下文还是满的——用户只看到一句报错，什么也
+        // 没发生，下一轮照样撞。
+        if let Err(err) = result {
+            crate::codext_compaction::recover_manual_compaction(&session, recovery_ctx, err).await?;
         }
         Ok(None)
     }

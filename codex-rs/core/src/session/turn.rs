@@ -270,6 +270,8 @@ pub(crate) async fn run_turn(
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
     let mut next_step_context = Some(first_step_context);
+    // codext: 上下文装不下时只当场压缩一次，见下面那个分支。
+    let mut compacted_after_overflow = false;
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -535,6 +537,36 @@ pub(crate) async fn run_turn(
                 });
                 sess.send_event(&turn_context, event).await;
                 break;
+            }
+            // codext: 上下文装不下不该终结这一轮——当场压缩一次再继续，压完就装得下了。
+            //
+            // 上游在这里直接结束，理由写在 `responses_retry::ends_the_turn` 的旧注释
+            // 里："同一个超长请求重试一万次还是装不下，用户在一轮之内也没法把它变短"。
+            // 那句话的前提是**中间不压缩**——而压缩恰恰就是把它变短的手段，只是上游
+            // 把压缩挂在 token 阈值的预判上，阈值没拦住的那一次就没人管了。
+            //
+            // 只压一次（`compacted_after_overflow`）：压完还装不下，说明单条内容本身
+            // 就超窗，那时结束才是诚实的；不设这个闸就会变成压缩—失败的死循环。
+            Err(err)
+                if matches!(err.details(), CodexErrorDetails::ContextWindowExceeded)
+                    && !compacted_after_overflow =>
+            {
+                compacted_after_overflow = true;
+                warn!("context window exceeded; compacting mid-turn and retrying once");
+                run_auto_compact(
+                    &sess,
+                    Arc::clone(&step_context),
+                    /*fallback_step_context*/ None,
+                    &mut client_session,
+                    InitialContextInjection::BeforeLastUserMessage {
+                        world_state: Arc::clone(&world_state),
+                        step_context: Arc::clone(&step_context),
+                    },
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::MidTurn,
+                )
+                .await?;
+                continue;
             }
             Err(e) => {
                 info!("Turn error: {e:#}");
@@ -1167,7 +1199,12 @@ async fn run_auto_compact(
         return Ok(());
     }
 
-    match turn_context.provider.capabilities().remote_compaction {
+    // codext: 远端压缩失败退回本地压缩，完整理由在 `codext_compaction` 的模块注释里。
+    // 逻辑放我们自己的文件、这里只留调用——`turn.rs` 是上游改得最勤的文件之一，塞进
+    // 来的每一行都要在下一次合并时重新解释一遍。
+    let local_turn_context = Arc::clone(&step_context.turn);
+    let local_injection = crate::codext_compaction::clone_injection(&initial_context_injection);
+    let remote_outcome = match turn_context.provider.capabilities().remote_compaction {
         RemoteCompactionSupport::V2
             if turn_context
                 .config
@@ -1188,7 +1225,7 @@ async fn run_auto_compact(
                 reason,
                 phase,
             )
-            .await?;
+            .await
         }
         RemoteCompactionSupport::V1 | RemoteCompactionSupport::V2 => {
             emit_compact_metric(
@@ -1205,7 +1242,7 @@ async fn run_auto_compact(
                 reason,
                 phase,
             )
-            .await?;
+            .await
         }
         RemoteCompactionSupport::Unsupported => {
             emit_compact_metric(
@@ -1213,17 +1250,30 @@ async fn run_auto_compact(
                 "local",
                 /*manual*/ false,
             );
-            run_inline_auto_compact_task(
+            return run_inline_auto_compact_task(
                 Arc::clone(sess),
-                Arc::clone(turn_context),
-                initial_context_injection,
+                local_turn_context,
+                local_injection,
                 reason,
                 phase,
             )
-            .await?;
+            .await;
+        }
+    };
+    match remote_outcome {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            crate::codext_compaction::recover_from_remote_failure(
+                sess,
+                local_turn_context,
+                local_injection,
+                reason,
+                phase,
+                err,
+            )
+            .await
         }
     }
-    Ok(())
 }
 
 pub(super) fn collect_explicit_app_ids_from_skill_items(

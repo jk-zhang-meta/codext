@@ -44,25 +44,39 @@ fn a_sampling_request_keeps_retrying_past_every_limit() {
     }
 }
 
-/// 只有四个出口，而且没有一个是"我们判断重试没用"。
+/// **只有用户自己按下的暂停能终结一轮。**
 ///
-/// 前两个**就是**用户按下的暂停——它们要是也重试，Esc 就失灵了，而"用户随时可以
-/// 自己叫停"正是无限重试能成立的前提。后两个是一轮之内改不掉的硬边界。
+/// 2026-08-09 起这张表就剩两个。它们要是也重试，Esc 就失灵了，而"用户随时可以自己
+/// 叫停"正是整套无限重试能成立的前提——把这个出口堵上，剩下的设计全部变成挂死。
 #[test]
-fn only_the_user_and_the_hard_walls_end_a_turn() {
+fn only_the_user_ends_a_turn() {
+    for err in [CodexErr::TurnAborted, CodexErr::Interrupted] {
+        assert!(ends_the_turn(&err), "{err} should end the turn");
+        assert!(!sampling_retries(&err), "{err} should not be retried");
+    }
+}
+
+/// 曾经在那张表里的三个，现在都要重试。
+///
+/// 三条论据当初听起来都成立，实际都不成立——而它们错判的代价是把一轮跑到一半的
+/// 会话直接掐断：
+///
+/// - `CyberPolicy`："安全判定是答复不是故障"。前提是判定确定性成立，实际这个分类器
+///   误判很常见，同样内容重发经常就过。
+/// - `ContextWindowExceeded`："重试一万次还是装不下"。前提是中间不压缩。
+/// - `SessionBudgetExceeded`：用户自设上限。这一个拿掉确实让那个配置失效，是按
+///   "除了 Esc 都别停"的口径有意为之，恢复方式写在 `ends_the_turn` 的注释里。
+#[test]
+fn the_three_former_hard_walls_now_retry() {
     for err in [
-        CodexErr::TurnAborted,
-        CodexErr::Interrupted,
-        CodexErr::ContextWindowExceeded,
-        CodexErr::SessionBudgetExceeded,
-        // 安全策略拒绝是**答复**，不是故障。反复问问不出别的结果，性质上也不该
-        // 由客户端自动去做。
         CodexErr::new(CodexErrorDetails::CyberPolicy {
             message: "refused".to_string(),
         }),
+        CodexErr::ContextWindowExceeded,
+        CodexErr::SessionBudgetExceeded,
     ] {
-        assert!(ends_the_turn(&err), "{err} should end the turn");
-        assert!(!sampling_retries(&err), "{err} should not be retried");
+        assert!(!ends_the_turn(&err), "{err} must no longer end the turn");
+        assert!(sampling_retries(&err), "{err} should keep retrying");
     }
 }
 
@@ -114,12 +128,18 @@ fn an_explicit_ceiling_is_honored() {
     assert!(!capped(5));
 }
 
-/// 计费失败不是账号级的。
+/// 没有池子时，计费失败不是账号级的。
 ///
-/// `QuotaExceeded` 说的是"检查你的套餐和账单"——它不随额度窗口重置恢复，也不带
-/// 额度读数，换号救不了它。它照样重试，但要按"不会自己好"来说。
+/// 一个号的 `QuotaExceeded`（"检查你的套餐和账单"）不随额度窗口重置恢复，手上又只有
+/// 这一个号，换无可换——它照样重试，但要按"不会自己好"来说。
+///
+/// **有池子时结论相反**，见 `is_account_scoped` 上的说明：池子里另一个号有它自己的
+/// 额度和账单。这个 helper 造的 `TurnContext` 没有装 external auth，所以这里断言的
+/// 正是"无池子"那一半。
 #[test]
-fn billing_failures_are_not_account_scoped() {
+fn billing_failures_are_not_account_scoped_without_a_pool() {
+    // 这个进程里池子没有派过号（`held_account_email()` 是 None），所以断言的是
+    // "无池子"那一半。
     assert!(!is_account_scoped(&CodexErr::QuotaExceeded));
     assert!(!is_account_scoped(&CodexErr::ServerOverloaded));
     assert!(!is_account_scoped(&CodexErr::Stream("x".to_string())));

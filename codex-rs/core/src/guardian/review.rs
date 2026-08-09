@@ -992,6 +992,18 @@ fn should_retry_guardian_review(outcome: &GuardianReviewOutcome) -> bool {
                         | CodexErrorInfo::ResponseStreamConnectionFailed { .. }
                         | CodexErrorInfo::InternalServerError
                         | CodexErrorInfo::ResponseStreamDisconnected { .. }
+                        // codext: 额度和鉴权失败也要重试，否则**基础设施故障会被呈现
+                        // 成安全拒绝**——复核跑不起来时 guardian 是 fail-closed 的，
+                        // 模型收到的是"该操作因风险不可接受被拒绝"，而真实原因是这个
+                        // 号的额度用完了或者凭据该换了。有池子时重试会重新取凭据、
+                        // 换一个号，复核就能跑起来；没池子时也该等窗口重置，而不是把
+                        // 一次基础设施抖动变成一条安全结论。
+                        //
+                        // `UsageLimitExceeded` 是上游给 UsageLimitReached /
+                        // QuotaExceeded / UsageNotIncluded 三个的统一映射，
+                        // `Unauthorized` 对应 RefreshTokenFailed。
+                        | CodexErrorInfo::UsageLimitExceeded
+                        | CodexErrorInfo::Unauthorized
                 ),
                 ..
             } | GuardianReviewError::Parse { .. }
