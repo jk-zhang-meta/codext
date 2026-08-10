@@ -3,6 +3,7 @@ use super::ends_the_turn;
 use super::is_account_scoped;
 use super::log_retry;
 use super::retry_is_allowed;
+use super::sidelines_the_account;
 use super::will_not_fix_itself;
 use crate::session::tests::make_session_and_context;
 use codex_protocol::error::CodexErr;
@@ -207,4 +208,35 @@ async fn sampling_retry_logs_stream_error_context() {
     assert!(logs.contains(
         "sampling_error=stream disconnected before completion: websocket closed by server before response.completed"
     ));
+}
+
+/// 换号 ≠ 让服务端把号雪藏起来。
+///
+/// 429 是 TPM/RPM 每分钟限速，约一分钟就恢复；而客户端能发的 `usage_limit` 让服务端
+/// 等整个额度窗口重置（小时级）。把前者报成后者，等于为一分钟的拥塞雪藏一个好号——
+/// 并发高时这会以分钟级速度掏空整个池子，然后 `POOL_EXHAUSTED` 让一切变成 30 秒
+/// 轮询，表现为"卡住不动"。
+///
+/// 所以 429 仍然算账号级（换个号继续，另一个号有自己的 TPM 桶），但**不上报**。
+#[test]
+fn a_rate_limit_swaps_accounts_without_sidelining_one() {
+    let four_two_nine = CodexErr::RetryLimit(codex_protocol::error::RetryLimitReachedError {
+        status: http::StatusCode::TOO_MANY_REQUESTS,
+        request_id: None,
+    });
+    // 没有池子时它连账号级都不算（换无可换）。
+    assert!(!is_account_scoped(&four_two_nine));
+    // 但无论如何，它永远不该被报成"这个号的额度窗口用尽了"。
+    assert!(!sidelines_the_account(&four_two_nine));
+
+    // 真正的额度用尽反过来：值得雪藏。
+    assert!(sidelines_the_account(&CodexErr::UsageLimitReached(
+        codex_protocol::error::UsageLimitReachedError {
+            plan_type: None,
+            resets_at: None,
+            rate_limits: None,
+            promo_message: None,
+            rate_limit_reached_type: None,
+        }
+    )));
 }

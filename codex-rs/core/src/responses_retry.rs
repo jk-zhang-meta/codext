@@ -259,7 +259,12 @@ impl RetryKind {
             return if leases_credentials(turn_context) {
                 // codext: 对面刚明确拒了手上这个号。报上去，否则服务端要等后台观测
                 // （最快 30 秒）才知道，这期间会把同一个跑满的号一次次发回来。
-                codex_login::report_account_refused();
+                //
+                // 但**只报值得雪藏的那些**：429 是分钟级限速，报成 `usage_limit` 会
+                // 让服务端把一个好号按几小时。见 `sidelines_the_account`。
+                if sidelines_the_account(err) {
+                    codex_login::report_account_refused();
+                }
                 Self::SwapAccount
             } else {
                 Self::QuotaWindow {
@@ -426,6 +431,38 @@ impl RetryKind {
 ///    下去——用户看到的是 "Error running remote compact task: You've hit your usage
 ///    limit…"，而手上明明还有二十几个号可用。兜底和上报补在 `turn.rs` 的
 ///    `run_auto_compact` 里。
+/// 这个错误值不值得让**服务端**把这个号按下去。
+///
+/// 和 [`is_account_scoped`] 分开，因为它们回答的是两个不同的问题：
+/// "换个号能不能继续"（是 → 换）和"这个号该被雪藏多久"（不一定 → 别乱报）。
+///
+/// 客户端只有两种拒绝理由，回避时长差着数量级：`unauthorized` 是 180 秒，
+/// `usage_limit` 是**等整个额度窗口重置**（小时级）。而 429 是 TPM/RPM 每分钟限速，
+/// 大约一分钟就恢复——把它报成 `usage_limit`，等于为了一分钟的拥塞把一个好号雪藏
+/// 几小时。
+///
+/// 2026-08-09 把 429 并进账号级时漏了这一层，后果是自我加速的：并发高 → 429 密集
+/// → 每撞一次雪藏一个号 → 池子以分钟级速度被掏空 → `POOL_EXHAUSTED` 一置位，
+/// `RetryKind::of` 对一切错误恒返回 `PoolExhausted`、30 秒轮询一次，看起来就是
+/// "卡住不动"。额度越紧张越容易触发，因为那时 429 最密集。
+///
+/// （同期出现的 `MCP startup interrupted` 是否同源**未经证实**：那条来自
+/// `StartupOutcomeError::Cancelled` / `startup_cancellation_token`，我没有把触发链
+/// 追到底。别把它当成这条已知因果的一部分。）
+///
+/// `pool.rs` 里那条注释早就写明了这个类别的错误："两者的回避时长差着几个数量级，
+/// 混成一个理由必然有一边是错的。"
+///
+/// 429 仍然**换号**（另一个号有自己的 TPM 桶），只是不上报——让服务端按自己的观测
+/// 去判断，而不是被我们一句误报的 `usage_limit` 骗走一个好号。
+fn sidelines_the_account(err: &CodexErr) -> bool {
+    if !is_account_scoped(err) {
+        return false;
+    }
+    // 唯一的例外：短时限速。
+    !matches!(err.details(), CodexErrorDetails::RetryLimit(_))
+}
+
 pub(crate) fn is_account_scoped(err: &CodexErr) -> bool {
     match err.details() {
         CodexErrorDetails::UsageLimitReached(_) => true,
