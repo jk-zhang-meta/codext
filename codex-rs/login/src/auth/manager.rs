@@ -732,6 +732,41 @@ impl CodexAuth {
     }
 
     /// Constructs in-memory ChatGPT auth from externally managed tokens.
+    /// 号池派下来的 **PAT**（`at-…` 那种不透明长期令牌）。
+    ///
+    /// 必须和 `from_external_chatgpt_tokens` 分开，因为这两种凭据在**能力**上
+    /// 就不一样，而上游已经把这件事编码进了 `supports_unauthorized_recovery`：
+    /// PAT 不在那张表里。
+    ///
+    /// 实测（2026-08-16，同一个 team 账号）：
+    ///
+    /// | 端点                              | PAT | OAuth |
+    /// |-----------------------------------|-----|-------|
+    /// | `codex/responses`（真正干活的）    | 200 | 200   |
+    /// | `wham/usage`                      | 200 | 200   |
+    /// | `wham/rate-limit-reset-credits`   | 401 | 200   |
+    /// | `plugins/featured`                | 401 | 200   |
+    /// | `models`                          | 401 | 200   |
+    ///
+    /// 那几个 401 的调用各自都有降级分支（"falling back to the usage response"、
+    /// "returning empty featured ids"），本来无害。但把 PAT 包成
+    /// `ChatgptAuthTokens` 会打开 401 恢复：一次附属调用的 401 → 重新问池子要号
+    /// → 还是同一个 PAT → 再 401，每 1.3 秒一轮，永不结束。终端表现是"发了消息
+    /// 没有任何反应"，而 `responses` 一次都没发出去过。
+    pub fn from_external_personal_access_token(
+        access_token: &str,
+        chatgpt_user_id: &str,
+        chatgpt_account_id: &str,
+        chatgpt_plan_type: Option<&str>,
+    ) -> Self {
+        Self::PersonalAccessToken(PersonalAccessTokenAuth::from_external(
+            access_token,
+            chatgpt_user_id,
+            chatgpt_account_id,
+            chatgpt_plan_type,
+        ))
+    }
+
     pub fn from_external_chatgpt_tokens(
         access_token: &str,
         chatgpt_account_id: &str,

@@ -51,6 +51,33 @@ impl PersonalAccessTokenAuth {
         hydrate_personal_access_token(&client, &endpoint, access_token).await
     }
 
+    /// 用**别人已经查好的**身份组装一份 PAT 凭据，不再自己去 whoami 问一趟。
+    ///
+    /// 号池就是这个"别人"：服务端派号时已经把 account_id、套餐、以及形如
+    /// `user-…::acct-…` 的 account_key 一起发下来了，那些正是 whoami 会回的
+    /// 东西。再问一次既多一个网络往返，也多一个会失败的地方——而它一旦失败，
+    /// 一份本来能用的凭据就整份作废。
+    ///
+    /// 拿不到的字段老实留空（email），不编。fedramp 一律按 false：这是个
+    /// 需要明确证据才能置位的标志，猜错会把请求发去错误的边缘节点。
+    pub(super) fn from_external(
+        access_token: &str,
+        chatgpt_user_id: &str,
+        chatgpt_account_id: &str,
+        chatgpt_plan_type: Option<&str>,
+    ) -> Self {
+        Self {
+            access_token: access_token.to_string(),
+            metadata: PersonalAccessTokenMetadata {
+                email: None,
+                chatgpt_user_id: chatgpt_user_id.to_string(),
+                chatgpt_account_id: chatgpt_account_id.to_string(),
+                chatgpt_plan_type: chatgpt_plan_type.unwrap_or("unknown").to_string(),
+                chatgpt_account_is_fedramp: false,
+            },
+        }
+    }
+
     pub fn access_token(&self) -> &str {
         &self.access_token
     }

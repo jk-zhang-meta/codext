@@ -635,3 +635,52 @@ async fn an_empty_pool_falls_back_to_the_local_auth() {
         "号一回来就该切回池子，退回本地不能变成一条单向路"
     );
 }
+
+/// 号池派下来的两种凭据必须落到**各自的**认证模式上。
+///
+/// 这不是分类洁癖：上游的 `supports_unauthorized_recovery` 把
+/// `ChatgptAuthTokens` 列为"401 之后去恢复"，而 PAT 不在表里。PAT 在
+/// `plugins/featured` / `rate-limit-reset-credits` / `models` 上本来就是 401
+/// （2026-08-16 实测），一旦被当成 ChatgptAuthTokens，那几个附属调用的 401
+/// 就会不停地去重新要号，每 1.3 秒一轮，`responses` 一次也发不出去。
+#[test]
+fn an_opaque_pool_token_becomes_personal_access_token_auth() {
+    let data: super::LeaseData = serde_json::from_str(
+        r#"{"account_key":"user-HEmy30VWx07XyeNh3STGa8bK::74ffdf33-9204-4797-9b00-2a6120b4f91c",
+            "plan":"team",
+            "auth_json":{"tokens":{"id_token":"","access_token":"at-Mq7xOpaque",
+                                   "account_id":"74ffdf33-9204-4797-9b00-2a6120b4f91c"}}}"#,
+    )
+    .expect("lease data");
+
+    let auth = PoolAuth::validate(&data).expect("PAT 必须能构造出凭据");
+    assert!(
+        auth.is_personal_access_token_auth(),
+        "at- 开头的令牌要走 PAT 模式，否则会打开 401 恢复循环"
+    );
+    // 账号归属来自服务端下发的字段，不是从令牌里解出来的。
+    assert_eq!(
+        auth.get_account_id().as_deref(),
+        Some("74ffdf33-9204-4797-9b00-2a6120b4f91c")
+    );
+}
+
+#[test]
+fn a_jwt_pool_token_still_becomes_chatgpt_auth_tokens() {
+    let data: super::LeaseData = serde_json::from_str(
+        r#"{"account_key":"user-abc::acct-def","plan":"plus",
+            "auth_json":{"tokens":{"access_token":"eyJhbGciOiJub25lIn0.eyJhIjoxfQ.sig",
+                                   "account_id":"acct-def"}}}"#,
+    )
+    .expect("lease data");
+
+    let auth = PoolAuth::validate(&data).expect("OAuth 令牌照旧");
+    assert!(auth.is_external_chatgpt_tokens(), "JWT 的那条路一字不能变");
+}
+
+/// account_key 的前半段就是 chatgpt_user_id；格式不对时留空而不是编一个。
+#[test]
+fn the_user_id_comes_from_the_account_key() {
+    assert_eq!(PoolAuth::user_id_of("user-1::acct-2"), "user-1");
+    assert_eq!(PoolAuth::user_id_of("没有分隔符"), "");
+}

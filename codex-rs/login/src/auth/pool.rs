@@ -35,6 +35,8 @@ use codex_utils_path::write_atomically;
 use serde::Deserialize;
 use serde::Serialize;
 
+use super::access_token::CodexAccessToken;
+use super::access_token::classify_codex_access_token;
 use super::default_client::create_client;
 use super::manager::AuthManager;
 use super::manager::CodexAuth;
@@ -648,11 +650,30 @@ impl PoolAuth {
         let account_id = data.auth_json.tokens.account_id.as_deref().ok_or_else(|| {
             std::io::Error::other("pool returned credentials without a chatgpt account id")
         })?;
-        CodexAuth::from_external_chatgpt_tokens(
-            &data.auth_json.tokens.access_token,
-            account_id,
-            data.plan.as_deref(),
-        )
+        let access_token = data.auth_json.tokens.access_token.as_str();
+        // 池子两种凭据都会派：ChatGPT 的 OAuth access token（JWT）和 PAT
+        // （`at-…`，不透明长期令牌）。**必须按各自的认证模式表示**，因为
+        // 它们能访问的端点不同——见 `from_external_personal_access_token`
+        // 上面那张实测表。判据用上游自己的前缀约定，不另立一套。
+        if matches!(
+            classify_codex_access_token(access_token),
+            CodexAccessToken::PersonalAccessToken(_)
+        ) {
+            return Ok(CodexAuth::from_external_personal_access_token(
+                access_token,
+                Self::user_id_of(&data.account_key),
+                account_id,
+                data.plan.as_deref(),
+            ));
+        }
+        CodexAuth::from_external_chatgpt_tokens(access_token, account_id, data.plan.as_deref())
+    }
+
+    /// `account_key` 是服务端的 `user-…::acct-…`，前半段就是 chatgpt_user_id。
+    ///
+    /// 取不到就给空串：这个字段只用于显示和遥测，编一个假的比留空更糟。
+    fn user_id_of(account_key: &str) -> &str {
+        account_key.split_once("::").map_or("", |(user_id, _)| user_id)
     }
 
     fn store(&self, account_key: String, auth: CodexAuth) -> CodexAuth {
