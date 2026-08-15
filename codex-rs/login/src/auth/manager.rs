@@ -1635,8 +1635,20 @@ impl AuthDotJson {
         chatgpt_account_id: &str,
         chatgpt_plan_type: Option<&str>,
     ) -> std::io::Result<Self> {
-        let mut token_info =
-            parse_chatgpt_jwt_claims(access_token).map_err(std::io::Error::other)?;
+        // access token 解不开就用一份空的 claims，**不要**把整份凭据判死。
+        //
+        // 这里解析的是 access token 本身，而它不保证是 JWT：ChatGPT 的 OAuth
+        // access token 是（`eyJh…`，两个点），但 PAT 是不透明串（`at-…`，一个点
+        // 都没有）。号池两种都会下发，而解出来的东西**紧接着就被覆盖掉了**——
+        // 下面两行把 chatgpt_account_id 和 chatgpt_plan_type 换成服务端给的值，
+        // 真正只从这里取的是 email / user_id / fedramp 这些显示用的元数据。
+        // 发请求要的两样（Bearer 令牌本身 + chatgpt-account-id）都不经过它。
+        //
+        // 曾经这里是 `?`：于是每一个 PAT 号一到终端就被丢掉，终端立刻再要一次、
+        // 又拿到同一个号。2026-08-15 线上有 45% 的租约这样空转，那个号整夜一轮
+        // 都没跑成，看起来像"号池没统计"。
+        // 用 Default 而不是逐字段写：上游给 IdTokenInfo 加字段时这里不会编不过。
+        let mut token_info = parse_chatgpt_jwt_claims(access_token).unwrap_or_default();
         token_info.chatgpt_account_id = Some(chatgpt_account_id.to_string());
         token_info.chatgpt_plan_type = chatgpt_plan_type
             .map(InternalPlanType::from_raw_value)

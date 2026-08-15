@@ -2512,3 +2512,35 @@ async fn missing_plan_type_maps_to_unknown() {
 
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
 }
+
+/// 号池会下发两种 access token：ChatGPT 的 OAuth 令牌是 JWT（`eyJh…`），而 PAT
+/// 是不透明串（`at-…`，一个点都没有）。后者解不出 claims，但它照样是一个能用的
+/// Bearer 令牌——发请求要的两样（令牌本身 + chatgpt-account-id）都不来自 claims。
+///
+/// 这里曾经是 `?`：PAT 号一到终端就被丢掉，终端立刻再要一次、又拿到同一个号，
+/// 空转到永远。
+#[test]
+fn an_opaque_access_token_still_yields_usable_credentials() {
+    let auth = CodexAuth::from_external_chatgpt_tokens(
+        "at-Mq7xOpaqueNotAJwt",
+        "74ffdf33-9204-4797-9b00-2a6120b4f91c",
+        Some("team"),
+    )
+    .expect("不透明的 access token 不该让整份凭据失效");
+
+    let tokens = auth.get_current_token_data().expect("token data");
+    // 令牌一字不改地带下去——它就是要发出去的那个 Bearer。
+    pretty_assertions::assert_eq!(tokens.access_token, "at-Mq7xOpaqueNotAJwt");
+    // 账号归属来自服务端下发的字段，不是从令牌里解出来的。
+    pretty_assertions::assert_eq!(
+        tokens.account_id.as_deref(),
+        Some("74ffdf33-9204-4797-9b00-2a6120b4f91c")
+    );
+    pretty_assertions::assert_eq!(
+        tokens.id_token.chatgpt_account_id.as_deref(),
+        Some("74ffdf33-9204-4797-9b00-2a6120b4f91c")
+    );
+    // 解不出来的部分老实留空，不编。
+    pretty_assertions::assert_eq!(tokens.id_token.email, None);
+    pretty_assertions::assert_eq!(tokens.id_token.raw_jwt, "");
+}
