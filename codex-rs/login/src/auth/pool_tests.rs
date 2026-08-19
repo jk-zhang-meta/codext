@@ -74,8 +74,7 @@ fn row_for<'a>(
     reported
         .iter()
         .find(|row| {
-            row.account_key.as_deref() == Some(account_key)
-                && row.model.as_deref() == Some(model)
+            row.account_key.as_deref() == Some(account_key) && row.model.as_deref() == Some(model)
         })
         .unwrap_or_else(|| panic!("{account_key}/{model} 应该有一条账：{reported:?}"))
 }
@@ -119,7 +118,10 @@ fn each_model_keeps_its_own_line() {
 
     let reported = super::pending_usage();
     assert_eq!(row_for(&reported, "acct-a", "gpt-5").total_tokens, 10);
-    assert_eq!(row_for(&reported, "acct-a", "gpt-5-codex").total_tokens, 300);
+    assert_eq!(
+        row_for(&reported, "acct-a", "gpt-5-codex").total_tokens,
+        300
+    );
 }
 
 /// 没租到号的时候跑的用量不归池子。
@@ -368,7 +370,8 @@ async fn the_pool_is_installed_on_the_path_the_cli_actually_takes() {
         },
         /*enable_codex_api_key_env*/ false,
     )
-    .await;
+    .await
+    .expect("auth manager initialization");
 
     assert!(
         manager.has_external_auth(),

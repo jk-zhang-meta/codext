@@ -141,6 +141,7 @@ use codex_response_debug_context::telemetry_transport_error_message;
 
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
+pub const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
@@ -582,7 +583,6 @@ impl ModelClient {
             self.state.auth_env_telemetry.clone(),
         );
         let request = self.build_responses_request(
-            &client_setup.api_provider,
             prompt,
             model_info,
             settings.effort,
@@ -631,6 +631,13 @@ impl ModelClient {
         ));
         if let Some(header_value) = self.generate_attestation_header_for().await {
             extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
+        }
+        if let Some(header_value) = self.build_routing_hint_header(
+            client_setup.auth.as_ref(),
+            &model,
+            service_tier.as_deref(),
+        ) {
+            extra_headers.insert(X_CODEX_ROUTING_HINT_HEADER, header_value);
         }
         add_responses_lite_header(&mut extra_headers, model_info.use_responses_lite);
         let compact_request_timeout = client_setup
@@ -840,10 +847,8 @@ impl ModelClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_responses_request(
         &self,
-        provider: &codex_api::Provider,
         prompt: &Prompt,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
@@ -929,7 +934,7 @@ impl ModelClient {
             tool_choice: "auto".to_string(),
             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
             reasoning: Some(reasoning),
-            store: provider.is_azure_responses_endpoint(),
+            store: false,
             stream: true,
             stream_options,
             include,
@@ -984,6 +989,31 @@ impl ModelClient {
             api_auth: resolved_auth.auth,
             agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
         })
+    }
+
+    fn build_routing_hint_header(
+        &self,
+        auth: Option<&CodexAuth>,
+        model: &str,
+        service_tier: Option<&str>,
+    ) -> Option<HeaderValue> {
+        let provider = self.state.provider.info();
+        if !auth.is_some_and(CodexAuth::uses_codex_backend)
+            || !provider.is_openai()
+            || !provider.requires_openai_auth
+            || provider.env_key.is_some()
+            || provider.experimental_bearer_token.is_some()
+            || provider.auth.is_some()
+            || provider.aws.is_some()
+        {
+            return None;
+        }
+
+        let routing_hint = match service_tier {
+            Some(tier) => format!("model={model};tier={tier}"),
+            None => format!("model={model}"),
+        };
+        HeaderValue::from_str(&routing_hint).ok()
     }
 
     fn build_api_transport(
@@ -1112,6 +1142,9 @@ impl ModelClient {
             Some(responses_metadata.thread_id.to_string()),
         ));
         headers.extend(self.build_responses_compatibility_headers(responses_metadata));
+        if let Some(routing_hint) = &responses_metadata.routing_hint {
+            headers.insert(X_CODEX_ROUTING_HINT_HEADER, routing_hint.clone());
+        }
         if let Some(header_value) = self.generate_attestation_header_for().await {
             headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
         }
@@ -1452,7 +1485,6 @@ impl ModelClientSession {
                 .await;
 
             let mut request = self.client.build_responses_request(
-                &client_setup.api_provider,
                 prompt,
                 model_info,
                 effort.clone(),
@@ -1460,6 +1492,15 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
+            if let Some(header_value) = self.client.build_routing_hint_header(
+                client_setup.auth.as_ref(),
+                &request.model,
+                request.service_tier.as_deref(),
+            ) {
+                options
+                    .extra_headers
+                    .insert(X_CODEX_ROUTING_HINT_HEADER, header_value);
+            }
             self.client
                 .prepare_response_items_for_request(&mut request.input);
             let request_session_telemetry =
@@ -1564,7 +1605,6 @@ impl ModelClientSession {
                 pending_retry,
             );
             let mut request = self.client.build_responses_request(
-                &client_setup.api_provider,
                 prompt,
                 model_info,
                 effort.clone(),
@@ -1572,6 +1612,12 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
+            let mut websocket_metadata = responses_metadata.clone();
+            websocket_metadata.routing_hint = self.client.build_routing_hint_header(
+                client_setup.auth.as_ref(),
+                &request.model,
+                request.service_tier.as_deref(),
+            );
             let request_session_telemetry = if warmup {
                 // `generate=false` prewarm is connection setup, not an inference request.
                 session_telemetry.clone()
@@ -1588,7 +1634,10 @@ impl ModelClientSession {
             // 连带清掉 `last_request`（`previous_response_id` 指向的是旧账号名下存
             // 的那次响应）和 turn state 头：这两样都是按账号绑定的，跨账号重放要么
             // 被拒、要么把一个账号的会话状态带到另一个账号上。
-            let leased_account = client_setup.auth.as_ref().and_then(CodexAuth::get_account_id);
+            let leased_account = client_setup
+                .auth
+                .as_ref()
+                .and_then(CodexAuth::get_account_id);
             if self.websocket_session.account.is_some()
                 && self.websocket_session.account != leased_account
             {
@@ -1608,7 +1657,7 @@ impl ModelClientSession {
                     session_telemetry,
                     api_provider: client_setup.api_provider,
                     api_auth: client_setup.api_auth,
-                    responses_metadata,
+                    responses_metadata: &websocket_metadata,
                     auth_context: request_auth_context,
                     request_route_telemetry: RequestRouteTelemetry::for_endpoint(
                         RESPONSES_ENDPOINT,

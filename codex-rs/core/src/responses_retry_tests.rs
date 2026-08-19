@@ -26,7 +26,13 @@ fn http_error(status: u16) -> CodexErr {
 }
 
 fn sampling_retries(err: &CodexErr) -> bool {
-    retry_is_allowed(err, 500, 5, ResponsesStreamRequest::Sampling, /*unbounded*/ true)
+    retry_is_allowed(
+        err,
+        500,
+        5,
+        ResponsesStreamRequest::Sampling,
+        /*unbounded*/ true,
+    )
 }
 
 /// 采样路径上没有次数上限。断开一个跑到一半的会话，代价永远高于多等一会儿。
@@ -168,9 +174,15 @@ fn a_network_failure_is_not_reported_as_something_to_fix() {
     assert!(!will_not_fix_itself(&CodexErr::Timeout, true));
     assert!(!will_not_fix_itself(&CodexErr::RequestTimeout, true));
     assert!(!will_not_fix_itself(&CodexErr::InternalServerError, true));
-    assert!(!will_not_fix_itself(&CodexErr::Stream("x".to_string()), true));
+    assert!(!will_not_fix_itself(
+        &CodexErr::Stream("x".to_string()),
+        true
+    ));
     // 代理返回 HTML 而不是 JSON——这个不会自己好。
-    assert!(will_not_fix_itself(&CodexErr::InvalidRequest("x".to_string()), true));
+    assert!(will_not_fix_itself(
+        &CodexErr::InvalidRequest("x".to_string()),
+        true
+    ));
 }
 
 #[tokio::test]

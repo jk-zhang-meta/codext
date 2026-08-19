@@ -81,7 +81,8 @@ impl SessionTask for CompactTask {
         // 上游在这里把错误吞掉就算完，但上下文还是满的——用户只看到一句报错，什么也
         // 没发生，下一轮照样撞。
         if let Err(err) = result {
-            crate::codext_compaction::recover_manual_compaction(&session, recovery_ctx, err).await?;
+            crate::codext_compaction::recover_manual_compaction(&session, recovery_ctx, err)
+                .await?;
         }
         Ok(None)
     }

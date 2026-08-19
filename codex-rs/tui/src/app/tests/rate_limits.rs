@@ -1,4 +1,5 @@
 use super::*;
+use crate::status::StatusAccountDisplay;
 use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
 use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::CreditsSnapshot;
@@ -8,7 +9,6 @@ use codex_app_server_protocol::RateLimitReachedType;
 use codex_app_server_protocol::RateLimitResetCreditsSummary;
 use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RateLimitWindow;
-use crate::status::StatusAccountDisplay;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use pretty_assertions::assert_eq;
@@ -55,7 +55,8 @@ async fn deliver_rolling_rate_limit_snapshot(
     app_server: &AppServerSession,
     snapshot: RateLimitSnapshot,
 ) {
-    deliver_rolling_rate_limit_snapshot_for_account(app, app_server, snapshot, /*email*/ None).await;
+    deliver_rolling_rate_limit_snapshot_for_account(app, app_server, snapshot, /*email*/ None)
+        .await;
 }
 
 async fn deliver_rolling_rate_limit_snapshot_for_account(

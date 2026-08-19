@@ -20,12 +20,12 @@
 //! 来的凭据本来就不带它，续期由服务端独占。多台机器各自拿着同一个 refresh token
 //! 去刷新，只会把彼此的令牌轮换作废。
 
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -273,7 +273,11 @@ fn unix_now() -> u64 {
 ///
 /// 换号只发生在两次调用之间（服务端对能用的号有黏性，只有被拒才换），所以"此刻
 /// 手上的号"就是刚才服务这次调用的号。
-pub fn record_turn_usage(session_id: &str, model: &str, usage: &codex_protocol::protocol::TokenUsage) {
+pub fn record_turn_usage(
+    session_id: &str,
+    model: &str,
+    usage: &codex_protocol::protocol::TokenUsage,
+) {
     if session_id.is_empty() {
         return;
     }
@@ -316,7 +320,10 @@ fn set_held_account(account_key: Option<String>, email: Option<String>) {
 /// 响应，所以邮箱也要在同一时刻取——每请求派号意味着「上一次是谁」和「下一次是谁」
 /// 通常不是同一个号，晚一步取到的就是另一个号的邮箱。
 pub fn held_account_email() -> Option<String> {
-    LEDGER.lock().ok().and_then(|ledger| ledger.held_email.clone())
+    LEDGER
+        .lock()
+        .ok()
+        .and_then(|ledger| ledger.held_email.clone())
 }
 
 /// 有没有一条还没送达服务端的拒绝。
@@ -538,9 +545,7 @@ impl PoolAuth {
     async fn current(&self, allow_stale: bool) -> std::io::Result<CodexAuth> {
         let refused = refusal_pending();
         // 有待报的拒绝时不能走合并窗：那份"刚刚的决定"正是刚被拒的那个号。
-        if !refused
-            && let Some(auth) = allow_stale.then(|| self.recent_decision()).flatten()
-        {
+        if !refused && let Some(auth) = allow_stale.then(|| self.recent_decision()).flatten() {
             return Ok(auth);
         }
         let held = self.held_account();
@@ -673,7 +678,9 @@ impl PoolAuth {
     ///
     /// 取不到就给空串：这个字段只用于显示和遥测，编一个假的比留空更糟。
     fn user_id_of(account_key: &str) -> &str {
-        account_key.split_once("::").map_or("", |(user_id, _)| user_id)
+        account_key
+            .split_once("::")
+            .map_or("", |(user_id, _)| user_id)
     }
 
     fn store(&self, account_key: String, auth: CodexAuth) -> CodexAuth {

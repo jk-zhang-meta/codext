@@ -41,10 +41,10 @@ use tracing::warn;
 
 use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
-use codex_protocol::error::Result as CodexResult;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tasks::emit_compact_metric;
+use codex_protocol::error::Result as CodexResult;
 
 /// 复制一份注入设置，供本地兜底那一趟使用。
 ///
@@ -201,7 +201,11 @@ pub(crate) async fn recover_manual_compaction(
         }),
     )
     .await;
-    emit_compact_metric(&sess.services.session_telemetry, "local", /*manual*/ true);
+    emit_compact_metric(
+        &sess.services.session_telemetry,
+        "local",
+        /*manual*/ true,
+    );
 
     const FIRST_WAIT: Duration = Duration::from_secs(30);
     const MAX_WAIT: Duration = Duration::from_secs(120);
@@ -217,12 +221,8 @@ pub(crate) async fn recover_manual_compaction(
                 .to_string(),
             text_elements: Vec::new(),
         }];
-        match crate::compact::run_compact_task(
-            Arc::clone(sess),
-            Arc::clone(&turn_context),
-            input,
-        )
-        .await
+        match crate::compact::run_compact_task(Arc::clone(sess), Arc::clone(&turn_context), input)
+            .await
         {
             Ok(()) => return Ok(()),
             Err(err) if crate::responses_retry::ends_the_turn(&err) => return Err(err),

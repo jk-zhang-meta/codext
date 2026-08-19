@@ -7,11 +7,16 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::util::backoff;
 use chrono::Utc;
+use codex_client::RetryOperation;
+use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use tracing::warn;
+
+const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -40,21 +45,20 @@ pub(crate) enum ResponsesStreamRequest {
 pub(crate) fn ends_the_turn(err: &CodexErr) -> bool {
     matches!(
         err.details(),
-        CodexErrorDetails::TurnAborted | CodexErrorDetails::Interrupted
-        // 2026-08-09：只剩用户自己按下的暂停。下面两个刻意保留成注释而不是删掉，
-        // 因为它们各自有过成立的理由，恢复时把行取消注释即可。
-        //
-        // | CodexErrorDetails::ContextWindowExceeded
-        //     上下文装不下。原来的理由是"同一个超长请求重试一万次还是装不下"——
-        //     那句话的前提是中间不压缩。现在 `turn.rs` 的专门分支会先当场压缩再继续
-        //     （见 `codext_compaction::compact_and_continue`），压完就装得下了，所以
-        //     这里不该再终结。注意：光把这一行注释掉是不够的，那个分支更早就
-        //     `return Err`，走不到这里。
-        //
-        // | CodexErrorDetails::SessionBudgetExceeded
-        //     用户自己设的开销上限。无限重试等于把这个设置悄悄作废——**这是这张表里
-        //     唯一一个"拿掉它就等于让用户的配置失效"的项**。当前按"除了 Esc 都别停"
-        //     的口径拿掉了；哪天想让 `/goal` 的预算重新硬起来，恢复这一行即可。
+        CodexErrorDetails::TurnAborted | CodexErrorDetails::Interrupted // 2026-08-09：只剩用户自己按下的暂停。下面两个刻意保留成注释而不是删掉，
+                                                                        // 因为它们各自有过成立的理由，恢复时把行取消注释即可。
+                                                                        //
+                                                                        // | CodexErrorDetails::ContextWindowExceeded
+                                                                        //     上下文装不下。原来的理由是"同一个超长请求重试一万次还是装不下"——
+                                                                        //     那句话的前提是中间不压缩。现在 `turn.rs` 的专门分支会先当场压缩再继续
+                                                                        //     （见 `codext_compaction::compact_and_continue`），压完就装得下了，所以
+                                                                        //     这里不该再终结。注意：光把这一行注释掉是不够的，那个分支更早就
+                                                                        //     `return Err`，走不到这里。
+                                                                        //
+                                                                        // | CodexErrorDetails::SessionBudgetExceeded
+                                                                        //     用户自己设的开销上限。无限重试等于把这个设置悄悄作废——**这是这张表里
+                                                                        //     唯一一个"拿掉它就等于让用户的配置失效"的项**。当前按"除了 Esc 都别停"
+                                                                        //     的口径拿掉了；哪天想让 `/goal` 的预算重新硬起来，恢复这一行即可。
     )
 }
 
@@ -74,7 +78,8 @@ pub(crate) fn ends_the_turn(err: &CodexErr) -> bool {
 /// 这不是给 guardian 开的特例：任何一个把自己的重试策略写在外面、并且用这个配置项
 /// 表达过"我自己管"的调用方，都该拿到上游那套行为。
 ///
-/// 账号级失败和池子枯竭仍然不受这个开关约束——那两件事是这套东西存在的理由。
+/// 账号级失败、池子枯竭和服务端容量不足仍然不受这个开关约束。后者必须在这里
+/// 放行，才能走到下面专门保留的 `ServerOverloaded` 重试策略。
 ///
 /// 连带的一条教训：`is_retryable()` 是**全仓共用的分类**，guardian、远端压缩、传输
 /// 回退、app-server 都读它。我们一度把 `ServerOverloaded` 在那里翻成"可重试"来表达
@@ -89,12 +94,29 @@ pub(crate) fn ends_the_turn_now(err: &CodexErr, turn_context: &TurnContext) -> b
         && !err.is_retryable()
         && !is_account_scoped(err)
         && !codex_login::pool_is_exhausted()
+        && !matches!(err.details(), CodexErrorDetails::ServerOverloaded)
+}
+
+pub(crate) struct ResponsesStreamRetryState {
+    retries: u64,
+    connection_retries: u64,
+    connection_retry_delay: Duration,
+}
+
+impl Default for ResponsesStreamRetryState {
+    fn default() -> Self {
+        Self {
+            retries: 0,
+            connection_retries: 0,
+            connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
+        }
+    }
 }
 
 /// Handles a retryable stream error and returns `Ok(())` when the caller should
 /// retry the request loop.
 pub(crate) async fn handle_retryable_response_stream_error(
-    retries: &mut u64,
+    retry_state: &mut ResponsesStreamRetryState,
     max_retries: u64,
     err: CodexErr,
     client_session: &mut ModelClientSession,
@@ -102,6 +124,38 @@ pub(crate) async fn handle_retryable_response_stream_error(
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
 ) -> Result<(), CodexErr> {
+    let operation = match request {
+        ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
+        ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
+    };
+
+    if turn_context
+        .config
+        .features
+        .enabled(Feature::UnboundedConnectionRetries)
+        && matches!(request, ResponsesStreamRequest::Sampling)
+        && matches!(err.details(), CodexErrorDetails::ConnectionFailed(_))
+        && !turn_context.session_source.is_internal()
+        && !turn_context.provider.info().is_amazon_bedrock()
+    {
+        let retry_delay = retry_state.connection_retry_delay;
+        warn!(
+            turn_id = %turn_context.sub_id,
+            error = %err,
+            ?retry_delay,
+            "stream connection failed; waiting to retry"
+        );
+        sess.notify_stream_error(turn_context, "Reconnecting... waiting for network", err)
+            .await;
+        retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
+        codex_client::record_retry!(retry_state.connection_retries, retry_delay, operation);
+        tokio::time::sleep(retry_delay).await;
+        retry_state.connection_retry_delay = retry_delay
+            .saturating_mul(2)
+            .min(MAX_CONNECTION_RETRY_DELAY);
+        return Ok(());
+    }
+
     // codext: `err.is_retryable()` 这一项是新加的，补的是上游一个隐含前提：以前
     // `turn.rs` 会先把不可重试的错误挡在外面，所以这里看到的必然是传输类故障。现在
     // 它们会走到这儿，而"模型不支持图片输入"这种拒绝换条通道重发还是同样被拒——白
@@ -111,7 +165,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
     // 见 `ends_the_turn_now`），但对"这条通道换一条试试"来说它是值得试的——一个
     // 只在 websocket 上挤爆的后端，回退到 HTTPS 确实可能通。
     if (err.is_retryable() || matches!(err.details(), CodexErrorDetails::ServerOverloaded))
-        && *retries >= max_retries
+        && retry_state.retries >= max_retries
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,
             &turn_context.model_info,
@@ -124,7 +178,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
             }),
         )
         .await;
-        *retries = 0;
+        retry_state.retries = 0;
         return Ok(());
     }
 
@@ -134,9 +188,15 @@ pub(crate) async fn handle_retryable_response_stream_error(
     let kind = (unconditional || !honors_ceiling(turn_context))
         .then(|| RetryKind::of(&err, turn_context, sess));
 
-    if retry_is_allowed(&err, *retries, max_retries, request, kind.is_some()) {
-        *retries = retries.saturating_add(1);
-        let retry_count = *retries;
+    if retry_is_allowed(
+        &err,
+        retry_state.retries,
+        max_retries,
+        request,
+        kind.is_some(),
+    ) {
+        retry_state.retries = retry_state.retries.saturating_add(1);
+        let retry_count = retry_state.retries;
         let base = err
             .retry_delay()
             .unwrap_or_else(|| backoff(retry_count.min(max_retries.max(1))));
@@ -157,6 +217,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
                 )
                 .await;
             }
+            codex_client::record_retry!(retry_count, base, operation);
             tokio::time::sleep(base).await;
             return Ok(());
         };
@@ -170,6 +231,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
             sess.notify_stream_error(turn_context, kind.message(), err)
                 .await;
         }
+        codex_client::record_retry!(retry_count, delay, operation);
         tokio::time::sleep(delay).await;
         return Ok(());
     }
@@ -392,7 +454,9 @@ impl RetryKind {
             Self::QuotaWindow { .. } => "account is out of quota and there is no pool to swap to",
             Self::Capacity => "selected model is at capacity",
             Self::Stuck => "request will not recover on its own",
-            Self::CredentialRejected => "leased credential was rejected - the pool is swapping accounts",
+            Self::CredentialRejected => {
+                "leased credential was rejected - the pool is swapping accounts"
+            }
             Self::CyberFlag => "request was flagged by the cybersecurity policy",
             // 瞬时故障沿用上游那条日志：它带着 retries/max_retries，是排查抖动时最有用的形状。
             Self::Transient => {
@@ -533,11 +597,13 @@ fn will_not_fix_itself(err: &CodexErr, trust_status_codes: bool) -> bool {
         // （挂在没有那条路由的服务上就是 404），但那说的是"这条通道走不通"，回退到
         // HTTPS 自己会解决，把它说成"去改配置"会把人指到完全错误的地方。所以只有
         // WebSocket 根本不参与时，状态码才能拿来下这个结论。
-        _ => trust_status_codes
-            && matches!(err.details(), CodexErrorDetails::UnexpectedStatus(_))
-            && err.http_status_code_value().is_some_and(|status| {
-                (400..500).contains(&status) && !RETRYABLE_4XX.contains(&status)
-            }),
+        _ => {
+            trust_status_codes
+                && matches!(err.details(), CodexErrorDetails::UnexpectedStatus(_))
+                && err.http_status_code_value().is_some_and(|status| {
+                    (400..500).contains(&status) && !RETRYABLE_4XX.contains(&status)
+                })
+        }
     }
 }
 
