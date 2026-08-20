@@ -435,6 +435,12 @@ struct Config {
     base_url: String,
     key: String,
     device_id: String,
+    /// 这次启动点名要的号（账号标识或邮箱）；`None` = 交给服务端调度。
+    ///
+    /// 每个进程一份，所以同一把密钥的不同会话可以各要各的号。**强首选而不是唯一
+    /// 选项**：号冷却或跑满时服务端回落公共池，会话不会停工；号一恢复，下一次
+    /// 请求自己排回最前面。
+    want_account: Option<String>,
 }
 
 /// `CODEX_HOME/pool.json`：`{"base_url": "https://…:844", "key": "…"}`
@@ -442,6 +448,10 @@ struct Config {
 struct StoredConfig {
     base_url: String,
     key: String,
+    /// 这个 `CODEX_HOME` 的默认账号，选填。给"一个目录固定用一个号"用；临时
+    /// 换号仍然走 `CODEXT_POOL_ACCOUNT`，它优先。
+    #[serde(default)]
+    account: Option<String>,
 }
 
 impl Config {
@@ -464,9 +474,25 @@ impl Config {
         })?;
         let key = env_non_empty("CODEXT_POOL_KEY")
             .or_else(|| stored.as_ref().map(|stored| stored.key.trim().to_string()))?;
+        // 点名的号：环境变量优先，其次 pool.json 里的默认值。ags 起 codex 时注入
+        // 的就是这个环境变量——它是**每个进程**一份，所以同一把密钥的不同会话可以
+        // 各要各的号而互不影响。
+        //
+        // 注意：光有它还不够。`device_id` 默认按**工作目录**取（见下），而服务端的
+        // 租约表在 `device_id` 上有唯一约束——同一个目录里的两个会话点不同的号，
+        // 必须连 `CODEXT_POOL_DEVICE_ID` 一起给，否则两边抢同一条租约行。
+        let want_account = env_non_empty("CODEXT_POOL_ACCOUNT").or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|stored| stored.account.as_deref())
+                .map(str::trim)
+                .filter(|account| !account.is_empty())
+                .map(str::to_string)
+        });
         Some(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             key,
+            want_account,
             // device_id 默认按**工作目录**取，不是每台机器一个、也不是每个进程
             // 一个。服务端按 device_id 认租约，同一个 id 会拿回同一个号：
             //
@@ -628,6 +654,7 @@ impl PoolAuth {
                 device_id: &self.config.device_id,
                 account_key,
                 reject,
+                want_account: self.config.want_account.as_deref(),
                 sessions,
             })
             .send()
@@ -756,6 +783,9 @@ struct PoolRequest<'a> {
     account_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reject: Option<&'a str>,
+    /// 这次启动点名要的号。见 [`Config::want_account`]。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    want_account: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sessions: Vec<SessionUsage>,
 }

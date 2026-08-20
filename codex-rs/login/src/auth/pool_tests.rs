@@ -271,13 +271,66 @@ fn next_request(pool: &PoolAuth) {
 }
 
 fn provider(server: &MockServer) -> (PoolAuth, tempfile::TempDir) {
+    provider_wanting(server, None)
+}
+
+fn provider_wanting(
+    server: &MockServer,
+    want_account: Option<&str>,
+) -> (PoolAuth, tempfile::TempDir) {
     let home = tempfile::tempdir().expect("tempdir");
     let pool = PoolAuth::new(Config {
         base_url: server.uri(),
         key: "test-key".to_string(),
         device_id: "test-device".to_string(),
+        want_account: want_account.map(str::to_string),
     });
     (pool, home)
+}
+
+/// 点名的号必须真的出现在派号请求里。
+///
+/// `body_partial_json` 只在请求体确实带了这个字段时才匹配；匹配不上 wiremock
+/// 直接不回，`resolve()` 会失败——所以这条测试是吃劲的，不是"跑通就算"。
+#[tokio::test]
+async fn a_wanted_account_is_sent_with_every_lease_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .and(body_partial_json(serde_json::json!({
+            "want_account": "someone@example.com"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-a")))
+        .mount(&server)
+        .await;
+
+    let (pool, _home) = provider_wanting(&server, Some("someone@example.com"));
+    pool.current(/*allow_stale*/ true)
+        .await
+        .expect("pool should serve the wanted account");
+}
+
+/// 没点名时**不能**发这个字段。
+///
+/// 发一个空串上去，服务端那边 `str(payload.get('want_account') or '').strip()`
+/// 虽然扛得住，但让"没点名"和"点名要一个空串"在网络上长得一样，迟早有人照着
+/// 空串去查。
+#[tokio::test]
+async fn no_wanted_account_means_the_field_is_absent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-a")))
+        .mount(&server)
+        .await;
+
+    let (pool, _home) = provider_wanting(&server, None);
+    pool.current(/*allow_stale*/ true).await.expect("lease");
+
+    let requests = server.received_requests().await.expect("requests");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("json body");
+    assert!(body.get("want_account").is_none(), "{body}");
 }
 
 /// 整套东西的关键一环，也是唯一能证明"接进去了"的测试。
