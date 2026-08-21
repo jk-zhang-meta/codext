@@ -115,6 +115,13 @@ static POOL_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 /// 等待是无限的，但话只说一次：每个请求都刷一遍"没号了"，等于把真正的提示淹掉。
 static EXHAUSTION_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
+/// 这个进程装上的池子，退出时要拿它交回名额。见 [`release_on_exit`]。
+///
+/// 单独存一份而不是从 `AuthManager` 问回来：`set_external_auth` 收下的是
+/// `Arc<dyn ExternalAuth>`，退出路径上再把它降回 `PoolAuth` 需要 `Any` 那一套，
+/// 而这里要的只是"装了没有"。
+static INSTALLED: std::sync::OnceLock<Arc<PoolAuth>> = std::sync::OnceLock::new();
+
 /// 池子此刻发不出号。
 pub fn pool_is_exhausted() -> bool {
     POOL_EXHAUSTED.load(Ordering::Relaxed)
@@ -395,7 +402,32 @@ pub(super) async fn install_if_configured(manager: &Arc<AuthManager>, codex_home
         mark_pool_serving();
         return;
     }
+    // 只在真的接管了凭据之后才登记。装不上的那条路上面已经 return 了，那种情况下
+    // 这个进程从没占过名额，退出时也就没有什么可交回的。
+    let _ = INSTALLED.set(pool.clone());
     spawn_idle_tick(pool);
+}
+
+/// 会话结束了：把调度名额交回池子。没配池子、或者池子没装上，就什么都不做。
+///
+/// **挂在 `cli/src/main.rs` 的 `main` 上**，因为那是整个二进制唯一的汇合点——所有
+/// 子命令都从那个闭包里出来。挑挂钩点的教训见 `AuthManager::shared_from_config`
+/// 上面那段：按函数级 churn 挑得中"这个函数会不会被改"，挑不中"谁还会调用它"，
+/// 所以必须钉在汇合点上。`fn main` 近四个发版一次没动过。
+///
+/// **它不承诺一定送到。** 进程被 SIGKILL、断网、或者走 `std::process::exit` 的那
+/// 几条错误路径时，谁也叫不到这里；服务端的 `CODEX_LEASE_TTL_SECONDS` 仍然是兜底。
+/// 这个调用只是把常见的正常退出从"最长一个 TTL 的幽灵持有者"压到接近 0。
+///
+/// 失败只记调试日志:此刻会话已经在退出了，没有任何人能对这个错误做点什么，而
+/// 拖慢或者吓到退出路径是实打实的代价。超时上限是 [`POOL_TIMEOUT`]（3 秒）。
+pub async fn release_on_exit() {
+    let Some(pool) = INSTALLED.get() else {
+        return;
+    };
+    if let Err(err) = pool.release().await {
+        tracing::debug!("codext: could not release the pool lease on exit: {err}");
+    }
 }
 
 /// 把账本接到 `CODEX_HOME`，并读回上次运行没报完的账。
@@ -635,6 +667,38 @@ impl PoolAuth {
         Ok(())
     }
 
+    /// 会话要退出了：把名额交回去，顺便把最后一批用量带上。
+    ///
+    /// 不走 [`PoolAuth::post`]：那个接口的语义是「派一个号给我」，服务端会为它建
+    /// 一份新租约——用它来释放等于刚放掉就又占一个。
+    ///
+    /// 用量一起带走是因为这是这个会话**最后一次开口**。20 秒的 [`IDLE_TICK`] 心跳
+    /// 只保证"跑着的时候不会积压太久"，退出前最后那一轮它未必来得及；账本虽然会
+    /// 落盘留给下一次运行补报，但"最后一次"常常真的就是最后一次。
+    async fn release(&self) -> std::io::Result<()> {
+        let url = format!("{}{PATH_PREFIX}/release", self.config.base_url);
+        let response = self
+            .client
+            .post(url.as_str())
+            .header(TOKEN_HEADER, self.config.key.as_str())
+            .header("Content-Type", "application/json")
+            .timeout(POOL_TIMEOUT)
+            .json(&ReleaseRequest {
+                device_id: &self.config.device_id,
+                sessions: pending_usage(),
+            })
+            .send()
+            .await
+            .map_err(std::io::Error::other)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(std::io::Error::other(format!(
+                "pool release failed: {status}"
+            )));
+        }
+        Ok(())
+    }
+
     /// 向池子要一个号。`Ok(None)` 是「此刻没号可发」——那是服务端的正常答复，
     /// 和「联系不上」不是一回事，两者的处置也不一样，见 [`PoolAuth::current`]。
     async fn post(
@@ -775,6 +839,16 @@ const REJECT_UNAUTHORIZED: &str = "unauthorized";
 /// 和 401 分开报：401 是"这份令牌该续期了"，等一轮就好；配额用尽要等整个窗口重置，
 /// 两者的回避时长差着几个数量级，混成一个理由必然有一边是错的。
 const REJECT_USAGE_LIMIT: &str = "usage_limit";
+
+/// [`PoolAuth::release`] 的请求体。故意不复用 [`PoolRequest`]：那个结构体的每个
+/// 字段都是"派号时告诉服务端的事"，释放一个字段都用不上，共用会让两边的契约互相
+/// 牵制——上游给派号加字段时，释放接口不该跟着变。
+#[derive(Serialize)]
+struct ReleaseRequest<'a> {
+    device_id: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sessions: Vec<SessionUsage>,
+}
 
 #[derive(Serialize)]
 struct PoolRequest<'a> {

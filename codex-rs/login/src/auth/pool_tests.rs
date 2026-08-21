@@ -343,6 +343,11 @@ async fn no_wanted_account_means_the_field_is_absent() {
 /// 压根不构造 `AuthManager`，所以它们永远显示"未登录"，跟池子通不通没有关系。
 #[tokio::test]
 async fn the_auth_manager_serves_pool_credentials_with_no_auth_json_on_disk() {
+    // `install_if_configured` 会 `attach_ledger`，把进程级账本的 `rows` 整个换成
+    // 磁盘上读到的（这个临时 HOME 里是空的）。不拿这把锁，它就会在别的测试
+    // 记完账、还没断言之前把账清掉——`the_last_turn_rides_out_on_the_release`
+    // 就是这样在并行下随机变红的。
+    let _ledger_guard = LEDGER_TEST_LOCK.lock().expect("test lock");
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/x8Rk3Nq6Vd2/lease"))
@@ -393,6 +398,11 @@ async fn the_auth_manager_serves_pool_credentials_with_no_auth_json_on_disk() {
 /// 不必是我们挂的那个函数，改调用图就够了。
 #[tokio::test]
 async fn the_pool_is_installed_on_the_path_the_cli_actually_takes() {
+    // `install_if_configured` 会 `attach_ledger`，把进程级账本的 `rows` 整个换成
+    // 磁盘上读到的（这个临时 HOME 里是空的）。不拿这把锁，它就会在别的测试
+    // 记完账、还没断言之前把账清掉——`the_last_turn_rides_out_on_the_release`
+    // 就是这样在并行下随机变红的。
+    let _ledger_guard = LEDGER_TEST_LOCK.lock().expect("test lock");
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/x8Rk3Nq6Vd2/lease"))
@@ -625,6 +635,11 @@ async fn an_empty_pool_does_not_keep_riding_the_old_lease() {
 /// 退回是**每次调用**的降级，不是切换：provider 还装着，下一次取凭据照样先问池子。
 #[tokio::test]
 async fn an_empty_pool_falls_back_to_the_local_auth() {
+    // `install_if_configured` 会 `attach_ledger`，把进程级账本的 `rows` 整个换成
+    // 磁盘上读到的（这个临时 HOME 里是空的）。不拿这把锁，它就会在别的测试
+    // 记完账、还没断言之前把账清掉——`the_last_turn_rides_out_on_the_release`
+    // 就是这样在并行下随机变红的。
+    let _ledger_guard = LEDGER_TEST_LOCK.lock().expect("test lock");
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/x8Rk3Nq6Vd2/lease"))
@@ -739,4 +754,92 @@ fn a_jwt_pool_token_still_becomes_chatgpt_auth_tokens() {
 fn the_user_id_comes_from_the_account_key() {
     assert_eq!(PoolAuth::user_id_of("user-1::acct-2"), "user-1");
     assert_eq!(PoolAuth::user_id_of("没有分隔符"), "");
+}
+
+/// 释放必须打 `/release`，**不能**打 `/lease`。
+///
+/// `/lease` 的语义是「派一个号给我」，服务端会为它建一份新租约——拿它来释放等于
+/// 刚交回名额就又占一个，净效果是零，而且看日志还以为释放成功了。
+///
+/// 这条测试是吃劲的：`/lease` 那个 mock 期望被调用 0 次，wiremock 在 drop 时校验。
+#[tokio::test]
+async fn releasing_does_not_go_through_the_lease_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/release"))
+        .and(body_partial_json(serde_json::json!({
+            "device_id": "test-device"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"released": true}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let (pool, _home) = provider_wanting(&server, None);
+    pool.release().await.expect("release should reach the pool");
+}
+
+/// 最后一轮用量跟着释放一起走。
+///
+/// 20 秒的心跳只保证「跑着的时候不会积压太久」，退出前最后那一轮它未必赶得上；
+/// 账本虽然落盘留给下一次运行补报，但"最后一次"常常真的就是最后一次。
+#[tokio::test]
+async fn the_last_turn_rides_out_on_the_release() {
+    // 账本是进程级静态，不拿这把锁就会看见别的测试的账（或者被它们清空）。
+    let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/release"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0,
+            "data": {"released": true}
+        })))
+        .mount(&server)
+        .await;
+
+    reset_ledger(None);
+    super::set_held_account(Some("acct-a".to_string()), None);
+    super::record_turn_usage("session-z", "gpt-5.5", &turn(1234));
+
+    let (pool, _home) = provider_wanting(&server, None);
+    pool.release().await.expect("release");
+
+    let requests = server.received_requests().await.expect("requests");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    let sessions = body["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("release body carried no sessions: {body}"));
+    assert_eq!(sessions.len(), 1, "{body}");
+    assert_eq!(sessions[0]["session_id"], "session-z", "{body}");
+    assert_eq!(sessions[0]["total_tokens"], 1234, "{body}");
+    reset_ledger(None);
+}
+
+/// 退出钩子必须真的挂在 `cli` 的 `main` 上。
+///
+/// 这条测试存在的唯一理由是 0.147.0 那次事故：`install_if_configured` 挂在
+/// `AuthManager::shared()` 上，上游在中间插了一层把调用改道，`shared()` 本身一个
+/// 字没动、合并零冲突、代码照编，而挂钩变成了死代码——表现是"codext 跑起来跟原生
+/// 一模一样"。**按函数级 churn 挑得中「这个函数会不会被改」，挑不中「谁还会调用
+/// 它」**，所以每个挂钩点都要有一条测试盯着它还在不在。
+///
+/// 读源码而不是跑二进制，是因为这里要证明的就是"那一行还在源码里"。上游把 `main`
+/// 的实现搬走时这条会红——那正是我们要的：合并时被迫重新看一眼，而不是静默失效。
+#[test]
+fn the_exit_hook_is_wired_into_the_cli_entry_point() {
+    const CLI_MAIN: &str = include_str!("../../../cli/src/main.rs");
+    assert!(
+        CLI_MAIN.contains("release_on_exit"),
+        "cli/src/main.rs 不再调用 release_on_exit：退出时不会交回调度名额，\
+         已退出的会话会一直占着并发除数直到服务端的租约 TTL 到期"
+    );
 }

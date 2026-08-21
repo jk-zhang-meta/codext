@@ -1040,7 +1040,15 @@ fn stage_str(stage: Stage) -> &'static str {
 fn main() -> anyhow::Result<()> {
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
-        cli_main(arg0_paths, remote_control_disabled).await?;
+        // codext: 这个闭包是整个二进制唯一的汇合点——每个子命令都从这里出来，所以
+        // 交回池子名额只需要挂这一处。**先接住结果再释放**，用 `?` 直接串起来的话
+        // 出错那条路会跳过释放，而"跑挂了"恰恰是最该把名额交回去的时候。
+        //
+        // 覆盖不到的是 `std::process::exit` 那几条和被信号打死的进程；服务端的
+        // 租约 TTL 仍然是兜底，见 `codex_login::release_on_exit`。
+        let result = cli_main(arg0_paths, remote_control_disabled).await;
+        codex_login::release_on_exit().await;
+        result?;
         Ok(())
     })
 }
