@@ -2532,12 +2532,6 @@ impl AuthManager {
     async fn load_auth(&self) -> Option<CodexAuth> {
         if let Some(external_auth) = self.external_auth_provider() {
             let cached_auth = self.auth_cached();
-            if cached_auth
-                .as_ref()
-                .is_some_and(|auth| self.refresh_failure_for_auth(auth).is_some())
-            {
-                return cached_auth;
-            }
             match self.resolve_external_auth(external_auth.as_ref()).await {
                 Ok(auth) => return Some(auth),
                 Err(err) => {
@@ -2561,6 +2555,11 @@ impl AuthManager {
                     // 凭据的降级，provider 还在，下一次照样先问池子。显式选择的 workload
                     // identity 仍走上面的上游分支，不能被本机凭据绕过。
                     tracing::warn!("codext: falling back to the local auth: {err}");
+                    if let RefreshTokenError::Permanent(error) = &err
+                        && let Some(auth) = cached_auth.as_ref()
+                    {
+                        self.record_permanent_refresh_failure_if_unchanged(auth, error);
+                    }
                     // 池子发的凭据被 `commit_external_auth` 镜像进了进程内的 Ephemeral
                     // 存储，而下面那条本地加载**先读它**——不清掉的话「退回本地」会原样
                     // 拿回刚刚用不了的那份，等于没退。
@@ -2570,6 +2569,11 @@ impl AuthManager {
                         AuthKeyringBackendKind::default(),
                     )
                     .delete();
+                    // Keep serving the last known credential for this call;
+                    // the next load still retries the external provider.
+                    if cached_auth.is_some() {
+                        return cached_auth;
+                    }
                 }
             }
         }
@@ -2868,19 +2872,47 @@ impl AuthManager {
             Some(auth) => auth,
             None => return Ok(()),
         };
-        if let Some(error) = self.refresh_failure_for_auth(&auth) {
+        if !self.has_external_auth()
+            && let Some(error) = self.refresh_failure_for_auth(&auth)
+        {
             return Err(RefreshTokenError::Permanent(error));
         }
 
         let attempted_auth = auth.clone();
-        // codext: 手上这份是本机 `auth.json` 登出来的话，续期只能走下面的本地路径。
-        // 那正是池子给不出号时退回的那份（见 `load_auth`），它自带 refresh token；按
-        // 「装没装 provider」判的话，它会被送去问池子——而池子正是刚才给不出号的那个。
-        // provider 自己发的凭据（池子的 ChatgptAuthTokens、bearer 的 Headers）不受影响。
-        let result = if self.has_external_auth() && !matches!(attempted_auth, CodexAuth::Chatgpt(_))
-        {
-            self.refresh_external_auth(ExternalAuthRefreshReason::Unauthorized)
-                .await
+        // codext: alternate between the pool and the local fallback. A pool
+        // outage may leave a local `auth.json` cached; a failure of that local
+        // refresh must not trap the process there forever. Conversely, a pool
+        // outage during the next attempt should still be allowed to fall back
+        // to the local credential. Each call makes at most one attempt per
+        // source, so this is a bounded alternation rather than recursion.
+        let result = if self.has_external_auth() {
+            let external_result = self
+                .refresh_external_auth(ExternalAuthRefreshReason::Unauthorized)
+                .await;
+            if external_result.is_ok() || !matches!(&attempted_auth, CodexAuth::Chatgpt(_)) {
+                external_result
+            } else {
+                match &attempted_auth {
+                    CodexAuth::Chatgpt(chatgpt_auth) => {
+                        let token_data = chatgpt_auth.current_token_data().ok_or_else(|| {
+                            RefreshTokenError::Transient(std::io::Error::other(
+                                "Token data is not available.",
+                            ))
+                        });
+                        match token_data {
+                            Ok(token_data) => {
+                                self.refresh_and_persist_chatgpt_token(
+                                    chatgpt_auth,
+                                    token_data.refresh_token,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    _ => external_result,
+                }
+            }
         } else {
             match auth {
                 CodexAuth::Chatgpt(chatgpt_auth) => {

@@ -1404,7 +1404,7 @@ async fn external_auth_keeps_cached_credentials_after_permanent_reload_failure()
     );
 
     assert_eq!(manager.auth().await, Some(auth));
-    assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 2);
+    assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

@@ -211,12 +211,11 @@ provider 一直装着，下一次照样先问池子，号一回来立刻切回�
 - 池子发的凭据被 `commit_external_auth` 镜像进了进程内的 **Ephemeral 存储**，而
   上游的本地加载**优先读它**。退回本地时必须先把它删掉，否则拿回的还是刚刚用不了
   的那份，等于没退。
-- 续期按**手上这份是谁发的**分流，不能按"装没装 provider"。退回的那份是本机
-  `CodexAuth::Chatgpt`，自带 refresh token，只能走上游的本地续期；按 provider 判
-  的话它会被送去问池子，而池子正是刚才给不出号的那个。判据是
-  `!matches!(auth, CodexAuth::Chatgpt(_))`——bearer provider 发的 `Headers` 凭据
-  仍归 provider 续，别收窄成 `is_external_chatgpt_tokens()`，那会打断上游的 bearer
-  路径（有测试盯着）。
+- 续期在 provider 模式下采用**有界交替**：先尝试池子；若当前缓存的是本机
+  `CodexAuth::Chatgpt` 且池子失败，再尝试本地 refresh token。下一次调用仍从池子
+  开始，因此不会因一次失败永久困在本地，也不会在一次调用里递归热循环。provider
+  发的 `Headers` 等凭据仍只走 provider 路径，别收窄成
+  `is_external_chatgpt_tokens()`，那会打断上游的 bearer 路径。
 
 主动续期没做：`auth()` 在 provider 模式下跳过 `should_refresh_proactively`，所以
 退回本地之后那份凭据要等一次 401 才被动续期。多一个往返，够用了。

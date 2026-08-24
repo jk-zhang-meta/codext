@@ -529,6 +529,9 @@
             "collaboration_modes": {
               "type": "boolean"
             },
+            "compaction_image_budget": {
+              "type": "boolean"
+            },
             "computer_use": {
               "type": "boolean"
             },
@@ -5428,6 +5431,9 @@
           "type": "boolean"
         },
         "collaboration_modes": {
+          "type": "boolean"
+        },
+        "compaction_image_budget": {
           "type": "boolean"
         },
         "computer_use": {
