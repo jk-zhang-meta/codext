@@ -206,8 +206,12 @@ struct Ledger {
     /// 合并窗之外会**重新派号**——用它来读一眼「现在是哪个号」，会把号读成另一个。
     /// 这个字段只写不问，读它永远不会改变任何东西。
     held_email: Option<String>,
-    /// 手上这个号刚被 OpenAI 以「配额用尽」拒了，等下一次派号时报上去。
-    refused: bool,
+    /// 手上这个号这一轮失败的原因，等下一次派号时报上去。
+    ///
+    /// 以前是个 `bool`，只表达得了「配额用尽」一件事，于是终端知道的其它每一种
+    /// 失败——403 被停用、402 计费、5xx、连不上——服务端一概看不见。现在带上原因
+    /// 本身；**怎么处置由服务端决定**，客户端只负责如实说发生了什么。
+    refusal: Option<String>,
     rows: Vec<LedgerRow>,
 }
 
@@ -217,7 +221,7 @@ impl Ledger {
             path: None,
             held: None,
             held_email: None,
-            refused: false,
+            refusal: None,
             rows: Vec::new(),
         }
     }
@@ -303,14 +307,25 @@ pub fn record_turn_usage(
     ledger.persist();
 }
 
-/// 手上这个号刚被 OpenAI 以「配额用尽」拒绝。
+/// 手上这个号这一轮被 OpenAI 拒了，记下原因等下一次派号时报上去。
 ///
 /// 这是**拒绝**不是**读数**：它是对方明确的答复，报错了也只会让报告者自己失去手上
 /// 这个号。服务端据此立刻把号按下去——否则它只能等后台观测（最快 30 秒）才知道，
 /// 而这期间会一次次把同一个已经跑满的号发回给正在重试的会话。
-pub fn report_account_refused() {
+///
+/// `reason` 是一个稳定的短标识（见 core 的 `reject_reason`）。**上报什么和服务端
+/// 拿它做什么是两件事**：客户端如实说发生了什么，回避多久由服务端按原因自己定。
+/// 这条分工是必须的——2026-08-09 把裸 429 也报成「配额用尽」，等于为了一分钟的
+/// TPM 拥塞把好号雪藏几小时，池子以分钟级速度被掏空。原因分开之后，那次误报在
+/// 结构上不可能再发生：429 报的是 `retry_limit_429`，它根本不在服务端的雪藏名单里。
+pub fn report_account_refused(reason: &str) {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return;
+    }
     if let Ok(mut ledger) = LEDGER.lock() {
-        ledger.refused = true;
+        // 后来的覆盖先前的：同一次失败会被重试几轮，最后一次的原因最接近现状。
+        ledger.refusal = Some(reason.chars().take(64).collect());
     }
 }
 
@@ -334,14 +349,14 @@ pub fn held_account_email() -> Option<String> {
 }
 
 /// 有没有一条还没送达服务端的拒绝。
-fn refusal_pending() -> bool {
-    LEDGER.lock().map(|ledger| ledger.refused).unwrap_or(false)
+fn refusal_reason() -> Option<String> {
+    LEDGER.lock().ok().and_then(|ledger| ledger.refusal.clone())
 }
 
 /// 拒绝已经报到服务端了，销账。只在派号请求成功之后调。
 fn clear_refusal() {
     if let Ok(mut ledger) = LEDGER.lock() {
-        ledger.refused = false;
+        ledger.refusal = None;
     }
 }
 
@@ -601,18 +616,18 @@ impl PoolAuth {
     /// （access token 通常还有十几分钟有效期，一次网络抖动不该打断会话）；凭据
     /// 刚被 401 拒绝时不行——那份已经被对面拒了，再用一次只会再失败一次。
     async fn current(&self, allow_stale: bool) -> std::io::Result<CodexAuth> {
-        let refused = refusal_pending();
+        let refusal = refusal_reason();
+        let refused = refusal.is_some();
         // 有待报的拒绝时不能走合并窗：那份"刚刚的决定"正是刚被拒的那个号。
         if !refused && let Some(auth) = allow_stale.then(|| self.recent_decision()).flatten() {
             return Ok(auth);
         }
         let held = self.held_account();
-        let reject = if refused {
-            Some(REJECT_USAGE_LIMIT)
-        } else {
-            (!allow_stale).then_some(REJECT_UNAUTHORIZED)
-        };
-        let posted = self.post(held.as_deref(), reject).await;
+        // 401 那条路（`allow_stale == false`）在没有别的原因可报时，报 401 本身。
+        let reject = refusal
+            .clone()
+            .or_else(|| (!allow_stale).then(|| REJECT_UNAUTHORIZED.to_string()));
+        let posted = self.post(held.as_deref(), reject.as_deref()).await;
         // **送到了才清标记。** 提前清掉的话，一次网络失败就永久丢掉这条消息，服务端
         // 再也不知道这个号满了，于是一次次把它发回来——正是要修的那个死循环。
         if refused && posted.is_ok() {
@@ -832,13 +847,17 @@ impl ExternalAuth for PoolAuth {
 
 /// 上游的 `ExternalAuthRefreshReason` 只有 `Unauthorized` 一个变体，所以走
 /// [`ExternalAuth::refresh`] 报上来的理由只有这一个。
-const REJECT_UNAUTHORIZED: &str = "unauthorized";
+pub const REJECT_UNAUTHORIZED: &str = "unauthorized";
 
 /// 手上这个号被 OpenAI 判了配额用尽。见 [`report_account_refused`]。
 ///
 /// 和 401 分开报：401 是"这份令牌该续期了"，等一轮就好；配额用尽要等整个窗口重置，
 /// 两者的回避时长差着几个数量级，混成一个理由必然有一边是错的。
-const REJECT_USAGE_LIMIT: &str = "usage_limit";
+///
+/// **这是一个线上契约**：服务端按这个字面量决定要不要把号按下去
+/// （`routes/codex_pool.py`）。改字符串等于让所有真配额耗尽都不再被雪藏，所以原因
+/// 由 core 分类、字面量在这里只此一份，两边不各写一遍。
+pub const REJECT_USAGE_LIMIT: &str = "usage_limit";
 
 /// [`PoolAuth::release`] 的请求体。故意不复用 [`PoolRequest`]：那个结构体的每个
 /// 字段都是"派号时告诉服务端的事"，释放一个字段都用不上，共用会让两边的契约互相

@@ -3,7 +3,7 @@ use super::ends_the_turn;
 use super::is_account_scoped;
 use super::log_retry;
 use super::retry_is_allowed;
-use super::sidelines_the_account;
+use super::reject_reason;
 use super::will_not_fix_itself;
 use crate::session::tests::make_session_and_context;
 use codex_protocol::error::CodexErr;
@@ -224,14 +224,16 @@ async fn sampling_retry_logs_stream_error_context() {
 
 /// 换号 ≠ 让服务端把号雪藏起来。
 ///
-/// 429 是 TPM/RPM 每分钟限速，约一分钟就恢复；而客户端能发的 `usage_limit` 让服务端
-/// 等整个额度窗口重置（小时级）。把前者报成后者，等于为一分钟的拥塞雪藏一个好号——
-/// 并发高时这会以分钟级速度掏空整个池子，然后 `POOL_EXHAUSTED` 让一切变成 30 秒
-/// 轮询，表现为"卡住不动"。
+/// 429 是 TPM/RPM 每分钟限速，约一分钟就恢复；而 `usage_limit` 让服务端等整个额度
+/// 窗口重置（小时级）。把前者报成后者，等于为一分钟的拥塞雪藏一个好号——并发高时
+/// 这会以分钟级速度掏空整个池子，然后 `POOL_EXHAUSTED` 让一切变成 30 秒轮询，表现
+/// 为"卡住不动"（2026-08-09 真实发生过）。
 ///
-/// 所以 429 仍然算账号级（换个号继续，另一个号有自己的 TPM 桶），但**不上报**。
+/// 现在**每一种失败都上报**，所以这条性质不再靠"要不要报"来保证，而是靠**报什么**：
+/// 只有 `UsageLimitReached` 映射到 `usage_limit`，429 映射到 `retry_limit_429`，
+/// 服务端的雪藏名单里没有后者。这个测试钉死的就是这个映射。
 #[test]
-fn a_rate_limit_swaps_accounts_without_sidelining_one() {
+fn a_rate_limit_is_never_reported_as_a_usage_limit() {
     let four_two_nine = CodexErr::RetryLimit(codex_protocol::error::RetryLimitReachedError {
         status: http::StatusCode::TOO_MANY_REQUESTS,
         request_id: None,
@@ -239,16 +241,61 @@ fn a_rate_limit_swaps_accounts_without_sidelining_one() {
     // 没有池子时它连账号级都不算（换无可换）。
     assert!(!is_account_scoped(&four_two_nine));
     // 但无论如何，它永远不该被报成"这个号的额度窗口用尽了"。
-    assert!(!sidelines_the_account(&four_two_nine));
+    assert_eq!(reject_reason(&four_two_nine), "retry_limit_429");
+    assert_ne!(reject_reason(&four_two_nine), codex_login::REJECT_USAGE_LIMIT);
 
-    // 真正的额度用尽反过来：值得雪藏。
-    assert!(sidelines_the_account(&CodexErr::UsageLimitReached(
-        codex_protocol::error::UsageLimitReachedError {
-            plan_type: None,
-            resets_at: None,
-            rate_limits: None,
-            promo_message: None,
-            rate_limit_reached_type: None,
-        }
-    )));
+    // 真正的额度用尽必须报成那个**线上契约**字面量，服务端按它决定要不要雪藏。
+    assert_eq!(
+        reject_reason(&CodexErr::UsageLimitReached(
+            codex_protocol::error::UsageLimitReachedError {
+                plan_type: None,
+                resets_at: None,
+                rate_limits: None,
+                promo_message: None,
+                rate_limit_reached_type: None,
+            }
+        )),
+        codex_login::REJECT_USAGE_LIMIT
+    );
+}
+
+/// 以前咽掉的那些失败，现在必须各自报出一个能区分的原因。
+///
+/// 403（号被停用）和 402（计费）在客户端是同一个变体 `UnexpectedStatus`，丢掉状态码
+/// 它们就没法区分了——而这两件事对人的意义完全不同。
+#[test]
+fn every_failure_carries_a_distinguishable_reason() {
+    let http_status = |status: http::StatusCode| {
+        reject_reason(&CodexErr::UnexpectedStatus(
+            codex_protocol::error::UnexpectedResponseError {
+                status,
+                body: String::new(),
+                user_message: None,
+                url: None,
+                cf_ray: None,
+                request_id: None,
+                identity_authorization_error: None,
+                identity_error_code: None,
+            },
+        ))
+    };
+    assert_eq!(http_status(http::StatusCode::FORBIDDEN), "http_403");
+    assert_eq!(http_status(http::StatusCode::PAYMENT_REQUIRED), "http_402");
+
+    // 没有状态码的变体走 Debug 名，转成 snake_case。
+    assert_eq!(
+        reject_reason(&CodexErr::new(CodexErrorDetails::ServerOverloaded)),
+        "server_overloaded"
+    );
+    assert_eq!(
+        reject_reason(&CodexErr::new(CodexErrorDetails::QuotaExceeded)),
+        "quota_exceeded"
+    );
+    assert_eq!(
+        reject_reason(&CodexErr::new(CodexErrorDetails::UsageNotIncluded)),
+        "usage_not_included"
+    );
+
+    // 原因绝不能是空串：`report_account_refused` 会把空的丢掉，等于又咽回去了。
+    assert!(!reject_reason(&CodexErr::new(CodexErrorDetails::Interrupted)).is_empty());
 }

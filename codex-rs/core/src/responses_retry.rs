@@ -317,16 +317,19 @@ impl RetryKind {
         if codex_login::pool_is_exhausted() {
             return Self::PoolExhausted;
         }
+        // codext: 手上这个号这一轮怎么失败的，如实报给池子——**不只是配额和 401**。
+        // 服务端后台每 5 分钟才问一次 `/usage`，而 `/usage` 和模型端点会对同一个号
+        // 给出矛盾的答案；终端是唯一一个看得见"真发请求会怎样"的地方。以前这里只报
+        // 值得雪藏的那两类，等于把 403 被停用、402 计费、5xx 全部咽掉了。
+        //
+        // 报什么和服务端拿它做什么是两件事，见 [`reject_reason`]：429 报的是
+        // `retry_limit_429`，不在服务端的雪藏名单里，所以 2026-08-09 那次误报在结构
+        // 上不可能重演。
+        if leases_credentials(turn_context) {
+            codex_login::report_account_refused(&reject_reason(err));
+        }
         if is_account_scoped(err) {
             return if leases_credentials(turn_context) {
-                // codext: 对面刚明确拒了手上这个号。报上去，否则服务端要等后台观测
-                // （最快 30 秒）才知道，这期间会把同一个跑满的号一次次发回来。
-                //
-                // 但**只报值得雪藏的那些**：429 是分钟级限速，报成 `usage_limit` 会
-                // 让服务端把一个好号按几小时。见 `sidelines_the_account`。
-                if sidelines_the_account(err) {
-                    codex_login::report_account_refused();
-                }
                 Self::SwapAccount
             } else {
                 Self::QuotaWindow {
@@ -484,9 +487,11 @@ impl RetryKind {
 ///
 /// 不算账号级的后果远不止"少换一次号"，有两层，第二层才是真正致命的：
 ///
-/// 1. [`RetryKind::of`] 里**只有账号级分支**会 `report_account_refused()`。不报，
-///    服务端就要等后台观测（最快 30 秒）才知道这个号废了，这期间它会一次次把同一个
-///    跑满的号发回给正在重试的会话——于是重试在做无用功，看起来像"卡住不动"。
+/// 1. 不换号，就只能在同一个已经废掉的号上一路撞墙。（上报**不再**受这一条约束：
+///    [`RetryKind::of`] 现在对每一种失败都调 `report_account_refused()`，见
+///    [`reject_reason`]。以前只有账号级分支才报，于是服务端要等后台观测——最快
+///    30 秒——才知道这个号废了，这期间它会一次次把同一个跑满的号发回给正在重试的
+///    会话，重试全在做无用功，看起来像"卡住不动"。）
 /// 2. 远端压缩那条路更早就断了：`compact_remote_v2.rs` 里
 ///    `Err(err) if !err.is_retryable() => return Err(err)` 挡在
 ///    `handle_retryable_response_stream_error` 之前，而 `is_retryable()` 对这一族
@@ -495,37 +500,6 @@ impl RetryKind {
 ///    下去——用户看到的是 "Error running remote compact task: You've hit your usage
 ///    limit…"，而手上明明还有二十几个号可用。兜底和上报补在 `turn.rs` 的
 ///    `run_auto_compact` 里。
-/// 这个错误值不值得让**服务端**把这个号按下去。
-///
-/// 和 [`is_account_scoped`] 分开，因为它们回答的是两个不同的问题：
-/// "换个号能不能继续"（是 → 换）和"这个号该被雪藏多久"（不一定 → 别乱报）。
-///
-/// 客户端只有两种拒绝理由，回避时长差着数量级：`unauthorized` 是 180 秒，
-/// `usage_limit` 是**等整个额度窗口重置**（小时级）。而 429 是 TPM/RPM 每分钟限速，
-/// 大约一分钟就恢复——把它报成 `usage_limit`，等于为了一分钟的拥塞把一个好号雪藏
-/// 几小时。
-///
-/// 2026-08-09 把 429 并进账号级时漏了这一层，后果是自我加速的：并发高 → 429 密集
-/// → 每撞一次雪藏一个号 → 池子以分钟级速度被掏空 → `POOL_EXHAUSTED` 一置位，
-/// `RetryKind::of` 对一切错误恒返回 `PoolExhausted`、30 秒轮询一次，看起来就是
-/// "卡住不动"。额度越紧张越容易触发，因为那时 429 最密集。
-///
-/// （同期出现的 `MCP startup interrupted` 是否同源**未经证实**：那条来自
-/// `StartupOutcomeError::Cancelled` / `startup_cancellation_token`，我没有把触发链
-/// 追到底。别把它当成这条已知因果的一部分。）
-///
-/// `pool.rs` 里那条注释早就写明了这个类别的错误："两者的回避时长差着几个数量级，
-/// 混成一个理由必然有一边是错的。"
-///
-/// 429 仍然**换号**（另一个号有自己的 TPM 桶），只是不上报——让服务端按自己的观测
-/// 去判断，而不是被我们一句误报的 `usage_limit` 骗走一个好号。
-fn sidelines_the_account(err: &CodexErr) -> bool {
-    if !is_account_scoped(err) {
-        return false;
-    }
-    // 唯一的例外：短时限速。
-    !matches!(err.details(), CodexErrorDetails::RetryLimit(_))
-}
 
 pub(crate) fn is_account_scoped(err: &CodexErr) -> bool {
     match err.details() {
@@ -555,6 +529,64 @@ pub(crate) fn is_account_scoped(err: &CodexErr) -> bool {
         }
         _ => false,
     }
+}
+
+/// 这次失败按什么原因报给池子。
+///
+/// 以前客户端只报得出两件事：401 和「配额用尽」。**它知道的其它每一种失败——403 被
+/// 停用、402 计费、5xx、连不上、策略拦截——服务端一概看不见**，只能靠后台每 5 分钟
+/// 问一次 `/usage` 去猜，而 `/usage` 和模型端点会对同一个号给出矛盾的答案。现在如实
+/// 报出发生了什么，**怎么处置由服务端定**。
+///
+/// 分工必须是这样，理由是一次真实事故：2026-08-09 把裸 429 也报成
+/// `usage_limit`，等于为了一分钟的 TPM 拥塞把好号雪藏几小时，池子以分钟级速度被
+/// 掏空、`POOL_EXHAUSTED` 一置位就整个卡住。**分开报之后这类误报在结构上不可能再
+/// 发生**：只有 `UsageLimitReached` 才映射到 `REJECT_USAGE_LIMIT`，429 报的是
+/// `retry_limit_429`，服务端的雪藏名单里根本没有它。
+///
+/// 带状态码的那两个把码带上（`http_403` / `retry_limit_429`）：同一个变体下 403 和
+/// 402 的意思差得很远，丢掉状态码等于把刚拿回来的信息又扔了。
+///
+/// 其余变体的名字直接从 `Debug` 取。上游加变体时这里不用跟着改——**认不出的原因
+/// 服务端本来就只记录不处置**，漏一个的代价是少一条日志，而为了跟上游对齐再维护
+/// 一张几十行的表，迟早会漂移。
+///
+/// （2026-08-09 同期出现的 `MCP startup interrupted` 是否同源**未经证实**：那条来自
+/// `StartupOutcomeError::Cancelled` / `startup_cancellation_token`，触发链没有追到底。
+/// 别把它当成上面那条已知因果的一部分。）
+pub(crate) fn reject_reason(err: &CodexErr) -> String {
+    match err.details() {
+        CodexErrorDetails::UsageLimitReached(_) => codex_login::REJECT_USAGE_LIMIT.to_string(),
+        CodexErrorDetails::RetryLimit(inner) => {
+            format!("retry_limit_{}", inner.status.as_u16())
+        }
+        CodexErrorDetails::UnexpectedStatus(inner) => {
+            format!("http_{}", inner.status.as_u16())
+        }
+        other => variant_slug(other),
+    }
+}
+
+/// `Debug` 的开头就是变体名，转成 `snake_case` 当原因用。
+fn variant_slug(details: &CodexErrorDetails) -> String {
+    let rendered = format!("{details:?}");
+    let name = rendered
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|part| !part.is_empty())
+        .unwrap_or("unknown");
+    let mut slug = String::with_capacity(name.len() + 8);
+    for (index, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index != 0 {
+                slug.push('_');
+            }
+            slug.push(ch.to_ascii_lowercase());
+        } else {
+            slug.push(ch);
+        }
+    }
+    // 服务端把理由存进一个有长度上限的列，这里先截断，别让它去截。
+    slug.chars().take(64).collect()
 }
 
 /// 同一个请求会以完全相同的方式失败，除非**外面**有人改点什么。

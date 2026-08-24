@@ -64,6 +64,8 @@ pub use auth::read_codex_access_token_from_env;
 pub use auth::read_openai_api_key_from_env;
 pub use auth::record_turn_usage;
 pub use auth::release_on_exit;
+pub use auth::REJECT_UNAUTHORIZED;
+pub use auth::REJECT_USAGE_LIMIT;
 pub use auth::report_account_refused;
 pub use auth::save_auth;
 pub use auth::take_pool_exhaustion_notice;

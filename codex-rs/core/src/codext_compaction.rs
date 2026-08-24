@@ -83,9 +83,8 @@ pub(crate) async fn recover_from_remote_failure(
         return Err(err);
     }
 
-    if crate::responses_retry::is_account_scoped(&err) {
-        codex_login::report_account_refused();
-    }
+    // 不再只报账号级的那几种：终端知道的每一种失败服务端都该看见，怎么处置由它定。
+    codex_login::report_account_refused(&crate::responses_retry::reject_reason(&err));
 
     warn!(
         compact_error = %err,
@@ -190,9 +189,8 @@ pub(crate) async fn recover_manual_compaction(
     ) {
         return Err(err);
     }
-    if crate::responses_retry::is_account_scoped(&err) {
-        codex_login::report_account_refused();
-    }
+    // 不再只报账号级的那几种：终端知道的每一种失败服务端都该看见，怎么处置由它定。
+    codex_login::report_account_refused(&crate::responses_retry::reject_reason(&err));
     warn!(compact_error = %err, "remote /compact failed; compacting locally instead");
     sess.send_event(
         &turn_context,

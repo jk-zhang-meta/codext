@@ -47,7 +47,7 @@ fn reset_ledger(path: Option<std::path::PathBuf>) {
     let mut ledger = super::LEDGER.lock().expect("ledger lock");
     ledger.path = path;
     ledger.held = None;
-    ledger.refused = false;
+    ledger.refusal = None;
     ledger.rows.clear();
 }
 
@@ -147,13 +147,37 @@ fn a_refusal_survives_until_it_is_delivered() {
     let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
     reset_ledger(None);
 
-    assert!(!super::refusal_pending());
-    super::report_account_refused();
+    assert_eq!(super::refusal_reason(), None);
+    super::report_account_refused("http_403");
     // 读它不销账：请求可能失败，那时候还得再报一次。
-    assert!(super::refusal_pending());
-    assert!(super::refusal_pending());
+    assert_eq!(super::refusal_reason().as_deref(), Some("http_403"));
+    assert_eq!(super::refusal_reason().as_deref(), Some("http_403"));
     super::clear_refusal();
-    assert!(!super::refusal_pending(), "送达之后不能再报第二遍");
+    assert_eq!(super::refusal_reason(), None, "送达之后不能再报第二遍");
+}
+
+/// 原因本身要带上，而不只是"被拒了"这一个比特。
+///
+/// 以前这里是个 `bool`，于是 403 被停用、402 计费、5xx 在服务端看来和配额用尽长得
+/// 一模一样——实际上它们该被完全不同地处置。
+#[test]
+fn the_refusal_carries_the_reason_not_just_a_flag() {
+    let _guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    reset_ledger(None);
+
+    super::report_account_refused(super::REJECT_USAGE_LIMIT);
+    assert_eq!(
+        super::refusal_reason().as_deref(),
+        Some(super::REJECT_USAGE_LIMIT)
+    );
+
+    // 后来的覆盖先前的：同一次失败会被重试几轮，最后一次最接近现状。
+    super::report_account_refused("retry_limit_429");
+    assert_eq!(super::refusal_reason().as_deref(), Some("retry_limit_429"));
+
+    // 空原因不记：记下来会让下一次派号带上一个空 reject，服务端只能当没说。
+    super::report_account_refused("   ");
+    assert_eq!(super::refusal_reason().as_deref(), Some("retry_limit_429"));
 }
 
 /// 账本要能跨进程重启接上。
