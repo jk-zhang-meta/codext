@@ -867,3 +867,79 @@ fn the_exit_hook_is_wired_into_the_cli_entry_point() {
          已退出的会话会一直占着并发除数直到服务端的租约 TTL 到期"
     );
 }
+
+/// 启动那一刻租不到号，**不等于**这个进程一辈子用不上池子。
+///
+/// 这是 2026-08-25 真实事故的回归用例：`install_if_configured` 只在进程启动时跑一次，
+/// 而它当时把「装 provider」绑在了「此刻能不能 resolve 出凭据」上。于是启动瞬间池子
+/// 抖一下（或恰好没号可派），provider 就永远装不上，`has_external_auth()` 恒为 false，
+/// core 的 `RetryKind::of` 据此判成「没有池子可换」，手上那个已经打满的本机号一路重试
+/// 到配额窗口重置——实测钉死 7.5 小时，其时池子是健康的、别的会话都在正常换号。
+///
+/// 现有用例（`an_unreachable_pool_does_not_drop_a_working_lease`、
+/// `an_empty_pool_does_not_keep_riding_the_old_lease`）覆盖的都是**已经有租约之后**的
+/// 抖动，恰好漏掉了启动这一刻——那时 `cached_auth()` 是空的，「连不上就继续骑旧租约」
+/// 那条兜底根本不成立。
+#[tokio::test]
+async fn a_pool_that_cannot_serve_at_startup_is_still_installed_and_recovers() {
+    let _ledger_guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    reset_ledger(None);
+
+    let server = MockServer::start().await;
+    // 第一次问：`data: null`——池子此刻没号可派（真事故里是网络抖动，两者在
+    // `current()` 里都归到 `Err`，走同一条安装路径）。
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_pool_body()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // 之后池子恢复供号。
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-a")))
+        .mount(&server)
+        .await;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        home.path().join("pool.json"),
+        serde_json::json!({"base_url": server.uri(), "key": "test-key"}).to_string(),
+    )
+    .expect("write config");
+
+    let manager = crate::auth::AuthManager::shared_from_auth_config(
+        crate::auth::AuthConfig {
+            codex_home: home.path().to_path_buf(),
+            auth_credentials_store_mode: crate::AuthCredentialsStoreMode::File,
+            keyring_backend_kind: crate::auth::AuthKeyringBackendKind::default(),
+            forced_login_method: None,
+            chatgpt_base_url: None,
+            forced_chatgpt_workspace_id: None,
+            managed_auth_policy: Default::default(),
+            auth_route_config: crate::test_support::transport_default_auth_route_config(),
+        },
+        /*enable_codex_api_key_env*/ false,
+    )
+    .await
+    .expect("auth manager initialization");
+
+    // 这一条是整个修复的要害：启动没租到号，provider 也必须装上。装不上的话
+    // `leases_credentials()` 为 false，配额用尽就再也换不了号了。
+    assert!(
+        manager.has_external_auth(),
+        "启动这一次没租到号，provider 仍然必须装上——否则这个进程一辈子换不了号，\
+         本机那个号打满之后只能干等配额窗口重置"
+    );
+
+    // 而且它必须真的能自愈：下一次取凭据重新问池子，号回来了就切回池子。
+    let auth = manager
+        .auth()
+        .await
+        .expect("池子恢复供号之后，下一次取凭据就该拿到池子的号");
+    assert_eq!(
+        auth.get_account_id().as_deref(),
+        Some("acct-pool"),
+        "自愈之后凭据必须来自池子，而不是继续用本机 auth.json"
+    );
+}

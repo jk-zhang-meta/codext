@@ -43,6 +43,7 @@ use super::manager::CodexAuth;
 use super::manager::ExternalAuth;
 use super::manager::ExternalAuthFuture;
 use super::manager::ExternalAuthRefreshContext;
+use super::manager::RefreshTokenError;
 
 /// 路径前缀沿用服务端那套不可猜测的形式，理由相同：这个端点不需要被发现。
 const PATH_PREFIX: &str = "/x8Rk3Nq6Vd2";
@@ -401,24 +402,43 @@ pub(super) async fn install_if_configured(manager: &Arc<AuthManager>, codex_home
     );
     attach_ledger(codex_home);
     let pool = Arc::new(PoolAuth::new(config));
-    // 装不上（池子不可达、密钥不对）不该让 codext 起不来：留在本地认证上，
-    // 用户至少还能用自己 `codex login` 登过的号。
+    // 装不上不该让 codext 起不来：留在本地认证上，用户至少还能用自己 `codex login`
+    // 登过的号。**但「这一刻租不到号」和「这台机器不允许用池子」必须分开处置。**
     if let Err(err) = manager.set_external_auth(pool.clone()).await {
-        tracing::warn!("codext: pool auth unavailable, keeping local auth: {err}");
-        // **把枯竭标记清掉再走。** 启动这一次如果拿到的是 `data: null`，
+        // **把枯竭标记清掉。** 启动这一次如果拿到的是 `data: null`，
         // `current()` 已经先 `mark_pool_exhausted()` 了；而清掉它的
-        // `mark_pool_serving()` 只在成功派号时调用——此刻 provider 没装上、心跳也没
-        // 起，三条能到达 `current()` 的路全断，这个标记就再也清不掉了。
+        // `mark_pool_serving()` 只在成功派号时调用。
         //
         // 后果是进程级的，而且看起来完全不像这个原因：`pool_is_exhausted()` 会让
         // `ends_the_turn_now` 对一切错误恒为 false、`retry_is_allowed` 恒为 true、
         // `RetryKind::of` 恒返回 `PoolExhausted`。于是一个"模型名写错"的 404 会变成
         // 30 秒一次、永不结束的重试，界面上还写着"去后台加一个账号"。
+        //
+        // 下面装上 provider 之后，心跳和逐请求两条路都会重新如实标记它。
         mark_pool_serving();
-        return;
+        // 永久性失败（工作负载身份、被管理策略挡掉的登录方式）换多少次都不会变，
+        // 装上去只是让每一次取凭据都白跑一趟。保持原样：退回本机认证。
+        if matches!(err, RefreshTokenError::Permanent(_)) {
+            tracing::warn!("codext: pool auth rejected permanently, keeping local auth: {err}");
+            return;
+        }
+        // 瞬时失败（池子不可达、此刻没号可派、密钥一时被拒）**不能**据此判定这个进程
+        // 一辈子都用不上池子——`install_if_configured` 只在启动跑一次，就这一次机会。
+        // 无条件把 provider 装上，首次租号推迟到真正要用凭据的时候：`load_auth` 每次
+        // 都会重新问它，取不到就退回本机 auth.json，号一回来自动切回池子。
+        //
+        // 不这么做的话，启动瞬间的一次抖动会把整个进程钉死在本机 auth.json 上，
+        // `has_external_auth()` 恒为 false，core 于是判成「没有池子可换」，手上那个号
+        // 打满之后一路重试到窗口重置（实测钉了 7.5 小时，其时池子是健康的）。
+        tracing::warn!(
+            "codext: the pool did not serve a lease at startup ({err}); \
+             installing it anyway and leasing on demand"
+        );
+        manager.set_external_auth_lazy(pool.clone());
     }
-    // 只在真的接管了凭据之后才登记。装不上的那条路上面已经 return 了，那种情况下
-    // 这个进程从没占过名额，退出时也就没有什么可交回的。
+    // 登记 + 起心跳。**这两件事必须在瞬时失败的路径上也发生**：`INSTALLED` 决定退出时
+    // 交不交回名额，而 `spawn_idle_tick` 正是启动没租到号时把号补上的那条自愈路径——
+    // 以前它们都在 `return` 之后，于是最需要自愈的那种情况恰恰一个都没起来。
     let _ = INSTALLED.set(pool.clone());
     spawn_idle_tick(pool);
 }

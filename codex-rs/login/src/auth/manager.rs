@@ -2636,6 +2636,35 @@ impl AuthManager {
         self.install_external_auth(external_auth).await
     }
 
+    /// 装上 provider，但**不要求此刻就能取到凭据**。
+    ///
+    /// [`Self::set_external_auth`] 在装之前先 `resolve()` 一次，于是「能不能装上」被绑在
+    /// 了「这一刻网络通不通、对面有没有货」上。对池子来说这是错误的耦合：启动瞬间的
+    /// 一次抖动、或者池子恰好没号可派，都会让 provider **永远**装不上——而
+    /// `install_if_configured` 只在进程启动时跑一次，没有第二次机会。后果不是「少换
+    /// 一次号」，是这个进程此后被钉死在本机 auth.json 上：`has_external_auth()` 恒为
+    /// false，[`crate::auth::manager`] 的调用方（core 的 `RetryKind::of`）于是判成
+    /// 「没有池子可换」，手上那个号打满之后一路重试到配额窗口重置——实测钉了 7.5 小时，
+    /// 而同一时刻池子是健康的、别的会话正常换号。
+    ///
+    /// 逐请求的兜底本来就已经写好了：[`Self::load_auth`] 每次都重新问 provider，失败
+    /// 才退回本机 auth.json（见那里的注释），**下一次取凭据还会再问一遍**。所以装上一个
+    /// 暂时取不到号的 provider 是安全的：它只是让「下一次再问一次」成为可能。
+    ///
+    /// 校验没有被跳过，只是推迟到首次真正取凭据的时候：那条路仍然走
+    /// [`Self::resolve_external_auth`]，里面照样 `validate_external_auth`。
+    pub fn set_external_auth_lazy(&self, external_auth: Arc<dyn ExternalAuth>) {
+        if self.workload_identity_selected {
+            return;
+        }
+        if let Ok(mut external_auth_slot) = self.external_auth.write() {
+            *external_auth_slot = Some(external_auth);
+        }
+        if let Ok(mut guard) = self.inner.write() {
+            guard.permanent_refresh_failure = None;
+        }
+    }
+
     async fn install_external_auth(
         &self,
         external_auth: Arc<dyn ExternalAuth>,
