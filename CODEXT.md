@@ -1,6 +1,6 @@
 # codext
 
-`openai/codex` 的分叉。基线 `rust-v0.147.0`，分支 `codext`，上游远端名 `upstream`。
+`openai/codex` 的分叉。基线 `rust-v0.150.1`，分支 `codext`，上游远端名 `upstream`。
 
 存在的唯一理由：**让 Codex 的凭据来自一个自建的账号池服务，而不是本机的
 `auth.json`**。一个人跑很多项目，用量摊在若干个账号上，谁都不像机器。
