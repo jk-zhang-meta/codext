@@ -1,6 +1,7 @@
 mod access_token;
 mod agent_identity;
 mod auth_headers;
+mod bedrock_access_keys;
 mod bedrock_api_key;
 pub mod default_client;
 pub mod error;
@@ -15,6 +16,8 @@ mod manager;
 mod revoke;
 
 pub use auth_headers::AuthHeaders;
+pub use bedrock_access_keys::BedrockAccessKeysAuth;
+pub use bedrock_access_keys::login_with_bedrock_access_keys;
 pub use bedrock_api_key::BedrockApiKeyAuth;
 pub use bedrock_api_key::login_with_bedrock_api_key;
 // codext: 池子的枯竭状态要能被 core 的重试循环看到——"没号可发"必须显性地报给
