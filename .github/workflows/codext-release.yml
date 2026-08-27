@@ -56,7 +56,7 @@ jobs:
           - runner: macos-14
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rust-toolchain.toml pins the channel; installing the target separately
       # is still needed because rustup only fetches the host one by default.
