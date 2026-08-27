@@ -293,8 +293,17 @@ provider 一直装着，下一次照样先问池子，号一回来立刻切回�
 
 - **`stream_max_retries` 现在是退出开关。** 没设过 = 永不放弃；设过 = 一字不差回到
   上游（退避曲线、日志、"Reconnecting... n/m" 措辞全都是）。这样"我不想要这个行为"
-  是一句配置的事，也让上游那批钉着次数的测试原样通过。但**账号级失败和池子枯竭不
-  受这个开关约束**——那两件事是这套东西存在的理由。
+  是一句配置的事。但**账号级失败、池子枯竭、`ServerOverloaded` 这三项不受这个开关
+  约束**（`responses_retry.rs` 的 `retry_is_allowed`）——它们是这套东西存在的理由，
+  不该被一个配置项关掉。
+
+  代价是上游 `core/tests/suite/retry_after.rs` 里那批"过载/限流最终会终止"的用例
+  （`*_overload_*_is_terminal`、`*_rate_limit_*_is_terminal`、
+  `responses_http_overload_without_retry_after_exhausts_request_retries` 等）
+  **按设计永远不会绿**：它们的 mock 恒定返回 503/429，而我们恒定重试，
+  那句 `TurnComplete` 永远不来，表现是测试挂住而不是失败。不改上游那个文件
+  （改了等于给足迹加一个上游每次动都会冲突的点，和 precomputed schema blob 同理），
+  跑测试时 `-- --skip retry_after` 跳过即可。
 - **远端压缩保留上限，但"有本地压缩兜底"这句话曾经是假的。** 这一条原来写着"失败
   有本地压缩兜底"，而上游的分派是**按 provider 能力选路**的：支持远端就走远端，只有
   `Unsupported` 才走本地——本地从来不是失败时的兜底。整个"保留上限"的决定架在一个
