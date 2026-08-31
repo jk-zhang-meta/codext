@@ -68,6 +68,7 @@ pub use auth::release_on_exit;
 pub use auth::REJECT_UNAUTHORIZED;
 pub use auth::REJECT_USAGE_LIMIT;
 pub use auth::report_account_refused;
+pub use auth::set_session_cwd;
 pub use auth::save_auth;
 pub use auth::take_pool_exhaustion_notice;
 pub use auth_env_telemetry::AuthEnvTelemetry;

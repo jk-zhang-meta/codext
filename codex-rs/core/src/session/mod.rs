@@ -4123,6 +4123,13 @@ impl Session {
     ) -> CodexResult<()> {
         if let Some(token_usage) = token_usage {
             // codext: 这一次调用刚结束，是唯一同时知道 token 数、账号和模型的位置。
+            //
+            // 顺手把**真正的工作目录**也报上去。后台原来显示的是 ags 启动时那个
+            // shell 的 `pwd`，而 ags 在哪儿被敲和 codex 在哪儿干活是两件事——实测
+            // 一台机器上四条会话都报 `/root`，各自的真实目录却在三个不同项目里。
+            codex_login::set_session_cwd(
+                turn_context.cwd.to_path_buf().to_string_lossy().as_ref(),
+            );
             codex_login::record_turn_usage(
                 &self.thread_id().to_string(),
                 turn_context.model_info().slug.as_str(),

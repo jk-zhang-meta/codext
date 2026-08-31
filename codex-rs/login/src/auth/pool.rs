@@ -207,6 +207,15 @@ struct Ledger {
     /// 合并窗之外会**重新派号**——用它来读一眼「现在是哪个号」，会把号读成另一个。
     /// 这个字段只写不问，读它永远不会改变任何东西。
     held_email: Option<String>,
+    /// 这条会话**真正的工作目录**，由 core 在每一轮告诉我们。
+    ///
+    /// 后台原来显示的是 ags 启动时那个 shell 的 `pwd`，而 ags 是在哪儿被敲的和
+    /// codex 在哪儿干活是两件事——实测一台机器上四条会话都报 `/root`（HOME），
+    /// 而它们各自的 `threads.cwd` 分别在三个不同的项目里。而且那个值只在启动时
+    /// 报一次，之后再不更新。
+    ///
+    /// 只有 core 知道真相，所以由它推过来；不持久化，进程内的事实每轮都会重报。
+    cwd: Option<String>,
     /// 手上这个号这一轮失败的原因，等下一次派号时报上去。
     ///
     /// 以前是个 `bool`，只表达得了「配额用尽」一件事，于是终端知道的其它每一种
@@ -222,6 +231,7 @@ impl Ledger {
             path: None,
             held: None,
             held_email: None,
+            cwd: None,
             refusal: None,
             rows: Vec::new(),
         }
@@ -328,6 +338,25 @@ pub fn report_account_refused(reason: &str) {
         // 后来的覆盖先前的：同一次失败会被重试几轮，最后一次的原因最接近现状。
         ledger.refusal = Some(reason.chars().take(64).collect());
     }
+}
+
+/// core 每一轮告诉我们这条会话此刻在哪个目录干活。见 [`Ledger::cwd`]。
+///
+/// 每轮都调，覆盖式写入：会话中途换目录也跟得上，而这正是启动时报一次做不到的。
+pub fn set_session_cwd(cwd: &str) {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return;
+    }
+    if let Ok(mut ledger) = LEDGER.lock() {
+        if ledger.cwd.as_deref() != Some(cwd) {
+            ledger.cwd = Some(cwd.to_string());
+        }
+    }
+}
+
+fn session_cwd() -> Option<String> {
+    LEDGER.lock().ok().and_then(|ledger| ledger.cwd.clone())
 }
 
 fn set_held_account(account_key: Option<String>, email: Option<String>) {
@@ -761,6 +790,7 @@ impl PoolAuth {
         reject: Option<&str>,
     ) -> std::io::Result<Option<LeaseData>> {
         let sessions = pending_usage();
+        let cwd = session_cwd();
         let url = format!("{}{PATH_PREFIX}/lease", self.config.base_url);
         let response = self
             .client
@@ -773,6 +803,7 @@ impl PoolAuth {
                 account_key,
                 reject,
                 want_account: self.config.want_account.as_deref(),
+                cwd: cwd.as_deref(),
                 sessions,
             })
             .send()
@@ -918,6 +949,9 @@ struct PoolRequest<'a> {
     /// 这次启动点名要的号。见 [`Config::want_account`]。
     #[serde(skip_serializing_if = "Option::is_none")]
     want_account: Option<&'a str>,
+    /// 这条会话真正的工作目录。见 [`Ledger::cwd`]。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sessions: Vec<SessionUsage>,
 }
