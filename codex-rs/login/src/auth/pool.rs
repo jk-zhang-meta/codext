@@ -690,8 +690,27 @@ impl PoolAuth {
                     Err(err)
                 }
             },
+            // 派号请求本身失败（连不上、5xx），而且上面那条宽容分支没接住——要么
+            // 手上这份刚被拒过，要么这是 401 那条路。
+            //
+            // **手上还有缓存凭据时不能把 held 抹掉。** 上一层
+            // （`manager.rs::load_auth`）在外部凭据解析失败时写着
+            // `// Keep serving the last known credential for this call;`——它会继续
+            // 用**这个号**发请求。抹掉就造出一个撕裂状态：进程正在用这个号，却对外
+            // 声称手上没有号；而 `RetryKind::of` 判 429 是不是账号级、要不要换号、
+            // 要不要上报，靠的正是 `held_account_email().is_some()`。于是这条会话的
+            // 每个 429 都被归成"网络故障"，进入无限重试：不上报、不换号，而且不会
+            // 自己好。2026-08-31 线上那条卡了十六分钟的会话就是这个形状。
+            //
+            // **只放过这一条路。** `Ok(None)`（服务端明说没号可发）照旧忘掉：那时
+            // `mark_pool_exhausted()` 已经让 `RetryKind::of` 走 `PoolExhausted`，不
+            // 存在误判；而且服务端本来就不打算再服务这个号，记着它会把退回本地之后
+            // 跑掉的用量记到它头上——见
+            // `an_empty_pool_does_not_keep_riding_the_old_lease`，那条契约写着理由。
             Err(err) => {
-                self.abandon_current().await?;
+                if self.cached_auth().is_none() {
+                    self.abandon_current().await?;
+                }
                 Err(err)
             }
         }

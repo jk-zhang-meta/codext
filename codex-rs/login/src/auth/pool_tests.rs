@@ -548,6 +548,59 @@ async fn the_held_account_is_sent_back_to_the_pool() {
     pool.current(true).await.expect("second lease");
 }
 
+/// 派号失败之后，**只要上一层还会继续用这个号，就不能声称"手上没号"**。
+///
+/// 这一条修的是一个撕裂状态。`AuthManager::load_auth` 在外部凭据解析失败时写着
+/// `// Keep serving the last known credential for this call;`——手上还有缓存凭据
+/// 时它继续用这个池子的号发请求。而这边原来无条件 `forget_lease()`，于是进程
+/// **正在用**这个号、却对外声称手上没有号。
+///
+/// 后果不是"少记一笔"：`RetryKind::of` 判 429 要不要换号、要不要上报，靠的就是
+/// `held_account_email().is_some()`。声称没号 ⇒ 429 被归成网络故障 ⇒ 无限重试、
+/// 不上报、不换号，而且不会自己好。2026-08-31 线上那条卡了十六分钟的会话就是它。
+#[tokio::test]
+async fn a_failed_lease_keeps_the_held_account_while_the_credential_is_still_in_use() {
+    // 这条测试读写进程级账本（`held_account_email` / `report_account_refused`），
+    // 必须和其它动账本的测试串行，否则互相踩，而且第一个 panic 会毒化这把锁、
+    // 让后面十几条全部变成 PoisonError，真正的失败被埋掉。
+    let _ledger_guard = LEDGER_TEST_LOCK.lock().expect("test lock");
+    reset_ledger(None);
+    let server = MockServer::start().await;
+    let good = Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lease_body("acct-a")))
+        .expect(1)
+        .named("first lease")
+        .mount_as_scoped(&server)
+        .await;
+
+    let (pool, _home) = provider(&server);
+    pool.current(true).await.expect("initial lease");
+    assert_eq!(super::held_account_email().is_some(), true);
+    drop(good);
+
+    // 之后派号一律失败，而且带着一条待报的拒绝——正是 429 之后的那个状态：
+    // 合并窗被绕过、`allow_stale` 也救不了，一定走到放弃分支。
+    Mock::given(method("POST"))
+        .and(path("/x8Rk3Nq6Vd2/lease"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    super::report_account_refused("retry_limit_429");
+    next_request(&pool);
+    let _ = pool.current(true).await;
+
+    // 上一层仍然拿得到这份凭据，所以身份必须还在。
+    assert!(
+        pool.cached_auth().is_some(),
+        "上一层要继续用的那份凭据不该被丢掉",
+    );
+    assert!(
+        super::held_account_email().is_some(),
+        "还在用这个号就不能声称手上没号——429 会因此被归成网络故障",
+    );
+}
+
 /// 池子连不上不该把正在跑的会话打断：手上的 access token 通常还有十几分钟有效期。
 #[tokio::test]
 async fn an_unreachable_pool_does_not_drop_a_working_lease() {
