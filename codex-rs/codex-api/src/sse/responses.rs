@@ -2042,6 +2042,7 @@ mod tests {
             code: None,
             plan_type: None,
             resets_at: None,
+            misalignment: None,
         };
 
         assert!(is_server_overloaded_error(&err));
@@ -2057,6 +2058,7 @@ mod tests {
             code: None,
             plan_type: None,
             resets_at: None,
+            misalignment: None,
         };
 
         assert!(!is_server_overloaded_error(&err));
