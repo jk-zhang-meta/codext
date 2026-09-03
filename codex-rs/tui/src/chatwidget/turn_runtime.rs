@@ -227,6 +227,13 @@ impl ChatWidget {
         if !self.collaboration_modes_enabled() {
             return;
         }
+        if self
+            .current_goal_status
+            .as_ref()
+            .is_some_and(GoalStatusState::is_active)
+        {
+            return;
+        }
         if self.has_queued_follow_up_messages() {
             return;
         }
@@ -341,7 +348,6 @@ impl ChatWidget {
         self.request_status_line_branch_refresh();
         self.request_status_line_git_summary_refresh();
         self.refresh_thread_usage_after_turn();
-        self.maybe_show_pending_rate_limit_prompt();
     }
 
     pub(super) fn on_server_overloaded_error(&mut self, message: String) {
@@ -357,6 +363,7 @@ impl ChatWidget {
         self.add_to_history(history_cell::new_warning_event(message));
         self.request_redraw();
         self.maybe_send_next_queued_input();
+        self.maybe_show_pending_rate_limit_prompt();
     }
 
     fn on_error(&mut self, message: String) {
@@ -372,6 +379,7 @@ impl ChatWidget {
 
         // After an error ends the turn, try sending the next queued input.
         self.maybe_send_next_queued_input();
+        self.maybe_show_pending_rate_limit_prompt();
     }
 
     pub(crate) fn handle_turn_start_rejection(&mut self, message: String) -> bool {
@@ -395,6 +403,7 @@ impl ChatWidget {
 
         // After an error ends the turn, try sending the next queued input.
         self.maybe_send_next_queued_input();
+        self.maybe_show_pending_rate_limit_prompt();
     }
 
     pub(super) fn on_rate_limit_error(&mut self, error_kind: RateLimitErrorKind, message: String) {
@@ -480,6 +489,7 @@ impl ChatWidget {
             self.add_to_history(history_cell::new_safety_access_block_event());
             self.request_redraw();
             self.maybe_send_next_queued_input();
+            self.maybe_show_pending_rate_limit_prompt();
         } else if let Some(info) = codex_error_info
             .as_ref()
             .and_then(app_server_rate_limit_error_kind)

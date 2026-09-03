@@ -215,6 +215,60 @@ async fn backend_banner_restores_only_programmatically_displaced_switch_prompt()
 }
 
 #[tokio::test]
+async fn settings_settlement_resumes_queue_before_displaced_rate_prompt() {
+    let (mut chat, _events, mut ops) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.has_chatgpt_account = true;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 95.0)));
+    chat.maybe_show_pending_rate_limit_prompt();
+
+    let mut response = banner_response(Some("inline"), json!([]));
+    response.rate_limit_upsell.as_mut().unwrap()["model_slug"] = json!("gpt-5");
+    chat.update_backend_banner(&response);
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+
+    chat.set_queue_autosend_suppressed(/*suppressed*/ true);
+    chat.set_model("gpt-5.2");
+
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+    chat.queue_user_message(UserMessage::from("queued after settings"));
+
+    if chat.bottom_pane.no_modal_or_popup_active() {
+        chat.settle_settings_selection();
+    }
+
+    assert!(chat.is_user_turn_pending_or_running());
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert_matches!(
+        next_submit_op(&mut ops),
+        Op::UserTurn { model, .. } if model == "gpt-5.2"
+    );
+}
+
+#[tokio::test]
+async fn settings_settlement_shows_deferred_rate_prompt_when_idle() {
+    let (mut chat, _events, _ops) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.has_chatgpt_account = true;
+    chat.rate_limit_switch_prompt = RateLimitSwitchPromptState::Pending;
+    chat.set_queue_autosend_suppressed(/*suppressed*/ true);
+
+    chat.settle_settings_selection();
+
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Shown
+    ));
+    assert!(!chat.bottom_pane.no_modal_or_popup_active());
+}
+
+#[tokio::test]
 async fn owner_notification_completion_cannot_cross_account_change() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
     let previous = chat

@@ -42,6 +42,60 @@ async fn rate_limit_recovery_holds_submissions_until_model_change() {
 }
 
 #[tokio::test]
+async fn rate_limit_recovery_resumes_before_optional_model_prompt() {
+    let (mut chat, _events, mut ops) = make_chatwidget_manual(Some("gpt-5")).await;
+    set_chatgpt_auth(&mut chat);
+    chat.thread_id = Some(ThreadId::new());
+    chat.rate_limit_switch_prompt = RateLimitSwitchPromptState::Pending;
+    handle_turn_started(&mut chat, "failed-turn");
+
+    chat.on_rate_limit_error(RateLimitErrorKind::UsageLimit, "Usage exhausted".into());
+
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+    chat.submit_user_message(UserMessage::from("queued follow-up"));
+
+    chat.finish_rate_limit_recovery();
+
+    assert!(chat.is_user_turn_pending_or_running());
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+    assert_matches!(
+        next_submit_op(&mut ops),
+        Op::UserTurn { model, .. } if model == "gpt-5"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_recovery_dismisses_owner_nudge_before_resuming() {
+    let (mut chat, _events, mut ops) = make_chatwidget_manual(Some("gpt-5")).await;
+    set_chatgpt_auth(&mut chat);
+    chat.thread_id = Some(ThreadId::new());
+    chat.codex_rate_limit_reached_type =
+        Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted);
+    handle_turn_started(&mut chat, "failed-turn");
+
+    chat.on_rate_limit_error(RateLimitErrorKind::Generic, "Usage exhausted".into());
+    assert!(!chat.bottom_pane.no_modal_or_popup_active());
+    chat.submit_user_message(UserMessage::from("queued follow-up"));
+
+    chat.finish_rate_limit_recovery();
+
+    assert!(chat.is_user_turn_pending_or_running());
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert_matches!(
+        next_submit_op(&mut ops),
+        Op::UserTurn { model, .. } if model == "gpt-5"
+    );
+}
+
+#[tokio::test]
 async fn rate_limit_recovery_preserves_settings_hold_and_clears_on_account_change() {
     let (mut chat, _events, mut ops) = make_chatwidget_manual(Some("test-model-a")).await;
     set_chatgpt_auth(&mut chat);

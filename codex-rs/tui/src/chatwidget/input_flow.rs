@@ -87,6 +87,12 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn settle_settings_selection(&mut self) {
+        self.set_queue_autosend_suppressed(/*suppressed*/ false);
+        self.maybe_send_next_queued_input();
+        self.maybe_show_pending_rate_limit_prompt();
+    }
+
     pub(super) fn on_modal_or_popup_closed(&mut self) {
         if self.input_queue.suppress_queue_autosend {
             self.app_event_tx.send(AppEvent::SettingsSelectionClosed);

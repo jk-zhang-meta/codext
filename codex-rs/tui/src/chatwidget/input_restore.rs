@@ -269,6 +269,7 @@ impl ChatWidget {
         }
         self.refresh_pending_input_preview();
         self.request_redraw();
+        self.maybe_show_pending_rate_limit_prompt();
     }
 
     /// Merge pending steers, queued drafts, and the current composer state into a single message.

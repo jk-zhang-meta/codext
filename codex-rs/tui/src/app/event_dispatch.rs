@@ -1556,9 +1556,7 @@ impl App {
                     if turn_permissions_overrides(permissions_override, config.cwd.as_path())
                         .is_ok()
                     {
-                        self.chat_widget
-                            .set_queue_autosend_suppressed(/*suppressed*/ false);
-                        self.chat_widget.maybe_send_next_queued_input();
+                        self.chat_widget.settle_settings_selection();
                     }
                 }
             }

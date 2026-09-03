@@ -994,6 +994,51 @@ async fn plan_implementation_popup_shows_after_proposed_plan_output() {
 }
 
 #[tokio::test]
+async fn plan_implementation_popup_defers_while_active_goal_continues() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
+    let plan_mask = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
+        .expect("expected plan collaboration mask");
+    chat.set_collaboration_mask(plan_mask);
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    let thread_id = thread_id.to_string();
+    chat.handle_server_notification(
+        ServerNotification::ThreadGoalUpdated(
+            codex_app_server_protocol::ThreadGoalUpdatedNotification {
+                thread_id: thread_id.clone(),
+                turn_id: None,
+                goal: codex_app_server_protocol::ThreadGoal {
+                    thread_id,
+                    objective: "Keep working".to_string(),
+                    status: codex_app_server_protocol::ThreadGoalStatus::Active,
+                    token_budget: None,
+                    tokens_used: 0,
+                    time_used_seconds: 0,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    chat.on_task_started();
+    chat.on_plan_delta("- Keep going\n".to_string());
+    chat.on_plan_item_completed("- Keep going\n".to_string());
+    chat.on_task_complete(
+        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(
+        !popup.contains(PLAN_IMPLEMENTATION_TITLE),
+        "expected no plan popup during active goal continuation, got {popup:?}"
+    );
+}
+
+#[tokio::test]
 async fn plan_implementation_popup_skips_when_steer_follows_proposed_plan() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);

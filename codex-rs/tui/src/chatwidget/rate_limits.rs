@@ -178,6 +178,10 @@ impl ChatWidget {
         if std::mem::take(&mut self.input_queue.rate_limit_recovery_pending) {
             self.submit_initial_user_message_if_pending();
             self.maybe_send_next_queued_input();
+            if self.is_user_turn_pending_or_running() {
+                self.bottom_pane.dismiss_view_by_id(WORKSPACE_NUDGE_VIEW_ID);
+            }
+            self.maybe_show_pending_rate_limit_prompt();
         }
     }
 
@@ -375,6 +379,25 @@ impl ChatWidget {
     }
 
     pub(super) fn maybe_show_pending_rate_limit_prompt(&mut self) {
+        // Automatic continuation can be decided just after a completion or
+        // error event clears the running state. Do not put a settings popup on
+        // top of that transition: it can steal composer focus and race the
+        // next turn's model settings, leaving the continuing task apparently
+        // stuck. Keep the state pending until the conversation is truly idle.
+        if self.bottom_pane.is_task_running()
+            || self.is_user_turn_pending_or_running()
+            || self.has_queued_follow_up_messages()
+            || self.input_queue.suppress_queue_autosend
+            || self.input_queue.submit_pending_steers_after_interrupt
+            || self.input_queue.rate_limit_recovery_pending
+            || self
+                .current_goal_status
+                .as_ref()
+                .is_some_and(GoalStatusState::is_active)
+            || !self.bottom_pane.no_modal_or_popup_active()
+        {
+            return;
+        }
         if self.has_applicable_backend_banner() {
             return;
         }

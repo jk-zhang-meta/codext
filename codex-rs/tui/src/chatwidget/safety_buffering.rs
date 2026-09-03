@@ -97,6 +97,7 @@ impl ChatWidget {
     pub(crate) fn cancel_safety_buffered_retry_submission(&mut self) {
         self.input_queue.user_turn_pending_start = false;
         self.clear_safety_buffering();
+        self.maybe_show_pending_rate_limit_prompt();
     }
 
     pub(super) fn on_model_safety_buffering_updated(

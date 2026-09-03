@@ -342,6 +342,7 @@ impl ChatWidget {
                     self.finalize_turn();
                     self.request_redraw();
                     self.maybe_send_next_queued_input();
+                    self.maybe_show_pending_rate_limit_prompt();
                 }
             }
             TurnStatus::InProgress => {}

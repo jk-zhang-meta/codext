@@ -1661,18 +1661,84 @@ async fn rate_limit_switch_prompt_respects_hidden_notice() {
 
 #[tokio::test]
 async fn rate_limit_switch_prompt_defers_until_task_complete() {
-    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5")).await;
+    let (mut chat, _, mut ops) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.has_chatgpt_account = true;
+    chat.thread_id = Some(ThreadId::new());
 
-    chat.bottom_pane.set_task_running(/*running*/ true);
     chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 90.0)));
     assert!(matches!(
         chat.rate_limit_switch_prompt,
         RateLimitSwitchPromptState::Pending
     ));
 
-    chat.bottom_pane.set_task_running(/*running*/ false);
-    chat.maybe_show_pending_rate_limit_prompt();
+    handle_turn_started(&mut chat, "turn-1");
+    chat.queue_user_message(UserMessage::from("queued follow-up"));
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+
+    // Completion starts the queued follow-up before checking the pending
+    // prompt. The prompt must not cover that live turn.
+    assert!(chat.is_user_turn_pending_or_running());
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert_matches!(
+        next_submit_op(&mut ops),
+        Op::UserTurn { model, .. } if model == "gpt-5"
+    );
+
+    handle_turn_started(&mut chat, "turn-2");
+    handle_turn_completed(&mut chat, "turn-2", /*duration_ms*/ None);
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Shown
+    ));
+}
+
+#[tokio::test]
+async fn rate_limit_switch_prompt_defers_across_error_follow_up() {
+    let (mut chat, _, mut ops) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.has_chatgpt_account = true;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 90.0)));
+    handle_turn_started(&mut chat, "turn-1");
+    chat.queue_user_message(UserMessage::from("queued follow-up"));
+
+    chat.on_server_overloaded_error("busy".to_string());
+
+    assert!(chat.is_user_turn_pending_or_running());
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+    assert_matches!(
+        next_submit_op(&mut ops),
+        Op::UserTurn { model, .. } if model == "gpt-5"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_switch_prompt_defers_while_active_goal_continues() {
+    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.has_chatgpt_account = true;
+    let thread_id = start_active_goal_turn(&mut chat);
+
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 90.0)));
+    chat.on_task_complete(
+        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+    );
+
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert!(matches!(
+        chat.rate_limit_switch_prompt,
+        RateLimitSwitchPromptState::Pending
+    ));
+
+    chat.on_task_started();
+    update_thread_goal(&mut chat, thread_id, AppThreadGoalStatus::Complete);
+    chat.on_task_complete(
+        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+    );
+
     assert!(matches!(
         chat.rate_limit_switch_prompt,
         RateLimitSwitchPromptState::Shown
