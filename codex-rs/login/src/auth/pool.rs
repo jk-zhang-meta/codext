@@ -905,6 +905,13 @@ impl ExternalAuth for PoolAuth {
         Box::pin(self.current(/*allow_stale*/ true))
     }
 
+    fn should_keep_cached_auth_on_error(&self) -> bool {
+        // `current()` drops the lease when the server explicitly reports an empty pool, so the
+        // manager can fall back to the local auth.json. A transport failure keeps the lease and
+        // must continue serving it for this call.
+        self.cached_auth().is_some()
+    }
+
     /// 上游只在一种情况下调这里：401。
     ///
     /// 服务端提前 15 分钟续期、租约只有 10 分钟，所以派出去的 token 不该是过期的

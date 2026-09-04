@@ -265,6 +265,14 @@ pub trait ExternalAuth: Send + Sync {
     fn classify_error(&self, error: std::io::Error) -> RefreshTokenError {
         RefreshTokenError::Transient(error)
     }
+
+    /// Whether a failed resolve should keep serving the currently cached auth.
+    ///
+    /// Providers that invalidate their current credential when resolution reports an error can
+    /// override this. The default preserves the historical behavior for external providers.
+    fn should_keep_cached_auth_on_error(&self) -> bool {
+        true
+    }
 }
 
 pub type ExternalAuthFuture<'a, T> = Pin<Box<dyn Future<Output = std::io::Result<T>> + Send + 'a>>;
@@ -2606,7 +2614,7 @@ impl AuthManager {
                     .delete();
                     // Keep serving the last known credential for this call;
                     // the next load still retries the external provider.
-                    if cached_auth.is_some() {
+                    if cached_auth.is_some() && external_auth.should_keep_cached_auth_on_error() {
                         return cached_auth;
                     }
                 }
