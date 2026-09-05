@@ -429,10 +429,10 @@ git diff --cached <新tag>        # 合并结果 vs 纯上游
 ## 构建
 
 本目录是规范源。**不要在这里 build/test**——`target/` 有好几个 GB，会把 OneDrive
-拖垮（`.mwignore` 已排除）。
+拖垮。
 
 ```
-cd <本目录> && mw sync
+rsync -a --delete --exclude target/ <本目录>/ ~/.agent-work/runtime/codext-<hash>/
 export PATH=$HOME/.cargo/bin:$PATH        # rustup，让 rust-toolchain.toml 生效
 cd ~/.agent-work/runtime/codext-<hash>/codex-rs
 cargo test -p codex-login pool
@@ -444,7 +444,7 @@ cargo build --release -p codex-cli        # 产物叫 codex，发布时改名 co
 `codex-tui` 会在 `semicolon_in_expressions_from_macros` 上失败——而 `cargo check`
 和 `cargo test` 都不会暴露这个问题。
 
-`mw sync` 之后**核对一下测试数量**：rsync 保留 mtime，DrvFs 的时间戳可能比构建
+复制之后**核对一下测试数量**：rsync 保留 mtime，DrvFs 的时间戳可能比构建
 产物还旧，cargo 会跳过重编。测试数没涨就是没同步上。
 
 ## 发布

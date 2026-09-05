@@ -359,6 +359,18 @@ fn session_cwd() -> Option<String> {
     LEDGER.lock().ok().and_then(|ledger| ledger.cwd.clone())
 }
 
+/// 最近一次已完成调用使用的模型；供下一次租约请求做能力判定留痕。
+fn requested_model() -> Option<String> {
+    LEDGER.lock().ok().and_then(|ledger| {
+        ledger
+            .rows
+            .iter()
+            .filter(|row| !row.model.is_empty())
+            .max_by_key(|row| row.updated_at)
+            .map(|row| row.model.clone())
+    })
+}
+
 fn set_held_account(account_key: Option<String>, email: Option<String>) {
     if let Ok(mut ledger) = LEDGER.lock() {
         ledger.held = account_key;
@@ -791,6 +803,7 @@ impl PoolAuth {
     ) -> std::io::Result<Option<LeaseData>> {
         let sessions = pending_usage();
         let cwd = session_cwd();
+        let model = requested_model();
         let url = format!("{}{PATH_PREFIX}/lease", self.config.base_url);
         let response = self
             .client
@@ -804,6 +817,7 @@ impl PoolAuth {
                 reject,
                 want_account: self.config.want_account.as_deref(),
                 cwd: cwd.as_deref(),
+                model: model.as_deref(),
                 sessions,
             })
             .send()
@@ -936,6 +950,9 @@ pub const REJECT_UNAUTHORIZED: &str = "unauthorized";
 /// 由 core 分类、字面量在这里只此一份，两边不各写一遍。
 pub const REJECT_USAGE_LIMIT: &str = "usage_limit";
 
+/// 模型端点明确返回 404（通常表示该账号/端点不提供请求模型）。
+pub const REJECT_MODEL_NOT_SUPPORTED: &str = "model_not_supported";
+
 /// [`PoolAuth::release`] 的请求体。故意不复用 [`PoolRequest`]：那个结构体的每个
 /// 字段都是"派号时告诉服务端的事"，释放一个字段都用不上，共用会让两边的契约互相
 /// 牵制——上游给派号加字段时，释放接口不该跟着变。
@@ -959,6 +976,9 @@ struct PoolRequest<'a> {
     /// 这条会话真正的工作目录。见 [`Ledger::cwd`]。
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<&'a str>,
+    /// 最近一次模型调用的模型名；服务端据此记录/诊断账号能力。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sessions: Vec<SessionUsage>,
 }

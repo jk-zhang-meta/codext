@@ -67,6 +67,7 @@ pub use auth::record_turn_usage;
 pub use auth::release_on_exit;
 pub use auth::REJECT_UNAUTHORIZED;
 pub use auth::REJECT_USAGE_LIMIT;
+pub use auth::REJECT_MODEL_NOT_SUPPORTED;
 pub use auth::report_account_refused;
 pub use auth::set_session_cwd;
 pub use auth::save_auth;

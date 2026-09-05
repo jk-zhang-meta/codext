@@ -29,7 +29,7 @@ Mach-O 的链接器,而且依赖树里的 C 构建脚本(`openssl-sys`、`ring` 
 ## 两条铁律
 
 1. **不要在 OneDrive 同步目录里编。** `target/` 有好几个 GB,会被同步回去。
-   Linux 端先 `mw sync` 到 `~/.agent-work/runtime/`;Mac 端直接 `git clone` 到
+   Linux 端先复制到 `~/.agent-work/runtime/`;Mac 端直接 `git clone` 到
    一个独立目录(而且 Mac 上的 OneDrive 是按需占位符,那份 `codext` 是 0 字节,
    本来也编不了)。
 
@@ -53,7 +53,7 @@ git tag -f v0.146.0 && git push -f origin v0.146.0
 ### 2. Linux 包
 
 ```
-cd <codext> && mw sync
+rsync -a --delete --exclude target/ <codext>/ ~/.agent-work/runtime/codext-<hash>/
 cd ~/.agent-work/runtime/codext-<hash>/codex-rs
 PATH=$HOME/.cargo/bin:$PATH cargo build --release --target x86_64-unknown-linux-gnu -p codex-cli
 ```

@@ -561,7 +561,11 @@ pub(crate) fn reject_reason(err: &CodexErr) -> String {
             format!("retry_limit_{}", inner.status.as_u16())
         }
         CodexErrorDetails::UnexpectedStatus(inner) => {
-            format!("http_{}", inner.status.as_u16())
+            if inner.status.as_u16() == 404 {
+                codex_login::REJECT_MODEL_NOT_SUPPORTED.to_string()
+            } else {
+                format!("http_{}", inner.status.as_u16())
+            }
         }
         other => variant_slug(other),
     }
