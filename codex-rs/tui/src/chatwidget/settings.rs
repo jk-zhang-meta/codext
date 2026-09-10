@@ -219,10 +219,6 @@ impl ChatWidget {
         });
     }
 
-    pub(crate) fn runtime_model_provider_base_url(&self) -> Option<&str> {
-        self.runtime_model_provider_base_url.as_deref()
-    }
-
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn model_catalog(&self) -> Arc<ModelCatalog> {
         self.model_catalog.clone()
