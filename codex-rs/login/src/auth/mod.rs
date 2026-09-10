@@ -3,6 +3,7 @@ mod agent_identity;
 mod auth_headers;
 mod bedrock_access_keys;
 mod bedrock_api_key;
+mod change_state;
 pub mod default_client;
 pub mod error;
 mod personal_access_token;
@@ -37,6 +38,7 @@ pub use pool::report_account_refused;
 // 位置，见 `pool::release_on_exit` 上面那段。
 pub use pool::release_on_exit;
 
+pub use change_state::AuthChangeState;
 pub use error::RefreshTokenFailedError;
 pub use error::RefreshTokenFailedReason;
 pub use manager::*;
